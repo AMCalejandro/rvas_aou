@@ -183,7 +183,7 @@ def run_all_logistic_models_cv(
     return all_results, df
 
 
-def run_logistic_regression_for_vsm(vsm: str, transformations: list, mt_path: str, output_bucket: str):
+def run_logistic_regression_for_vsm(vsm: str, transformations: list, mt_path: str):
     import pickle
     
     mt = hl.read_matrix_table(mt_path)
@@ -191,18 +191,14 @@ def run_logistic_regression_for_vsm(vsm: str, transformations: list, mt_path: st
 
     ht, feature_names = prepare_regression_features(mt, vsm, transformations=transformations)
     all_res, _ = run_all_logistic_models_cv(ht, feature_names)
-
-    local_file = f"{vsm}_all_res.pkl"
-    with open(local_file, "wb") as f:
-        pickle.dump(all_res, f)
     
-    return local_file
+    return all_res
 
 
 def main(args):
     
     backend = hb.ServiceBackend(
-        billing_project="all-by-aou", remote_tmpdir=TMP_BUCKET
+        billing_project="---", remote_tmpdir=TMP_BUCKET
     )
     b = hb.Batch(name="LogReg VSMs", backend=backend)
     
@@ -216,14 +212,13 @@ def main(args):
             j.memory("highmem")
             j.cpu(8)
             j.env('PYSPARK_SUBMIT_ARGS', '--driver-memory 24g --executor-memory 24g pyspark-shell')
-            local_pkl_file = j.call(
+            preds = j.call(
                 run_logistic_regression_for_vsm,
                 vsm=vsm,
                 transformations=['linear', 'square', 'cube', 'exp'],
-                mt_path=mt_path,
-                output_bucket=output_bucket
+                mt_path=mt_path
             )
-            b.write_output(local_pkl_file, f'gs://{output_bucket}/results/{vsm}_all_res.pkl')
+            b.write_output(preds.as_json(), f'gs://{output_bucket}/results/mean_impute/{vsm}_all_res.json')
         
         b.run()
 
