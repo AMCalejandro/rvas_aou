@@ -2,6 +2,38 @@ import numpy as np
 import pandas as pd
 from numpy.linalg import LinAlgError
 
+
+def _nearest_psd(A, eps=1e-10):
+    """Project a symmetric matrix to the nearest PSD by clipping eigenvalues."""
+    A = (A + A.T) / 2.0
+    w, V = np.linalg.eigh(A)
+    w_clipped = np.clip(w, a_min=eps, a_max=None)
+    return (V * w_clipped) @ V.T
+
+def _logpdf_mvn(x, mean, Sigma):
+    """
+    Numerically stable log-density of MVN using Cholesky.
+    x, mean: (k,)
+    Sigma: (k,k), assumed SPD (or very nearly)
+    """
+    k = x.shape[0]
+    try:
+        L = np.linalg.cholesky(Sigma)
+    except LinAlgError:
+        # Small diagonal jitter then try again
+        jitter = 1e-8 * np.mean(np.diag(Sigma))
+        if not np.isfinite(jitter) or jitter == 0:
+            jitter = 1e-8
+        Sigma = Sigma + jitter * np.eye(k)
+        L = np.linalg.cholesky(_nearest_psd(Sigma))
+    
+    diff = x - mean
+    # Solve L * y = diff
+    y = np.linalg.solve(L, diff)
+    quad = y @ y
+    logdet = 2.0 * np.sum(np.log(np.diag(L)))
+    return -0.5 * (k * np.log(2.0 * np.pi) + logdet + quad)
+
 def compute_scallion_scores(
     gene: str,
     beta_lof: np.ndarray,              # shape (T,)
