@@ -23,13 +23,11 @@ def main(args):
 
     if not hl.hadoop_exists(save_out_ht):
         from utils.processing import (
-            load_gene_matrix,
             filter_gene_matrix,
             get_significant_genes
         )
         
-        gene_mt = load_gene_matrix(genebass_gene_path)
-        gene_mt_clean = filter_gene_matrix(gene_mt, phenos_cor_path, pval_threshold = 2.5e-6)
+        gene_mt_clean = filter_gene_matrix(genebass_gene_path, phenos_cor_path, pval_threshold = 2.5e-6)
         gene_ht, plof_genes = get_significant_genes(gene_mt_clean, save_out_ht)
     else:
         plof_genes = pd.read_csv(f'{".".join(save_out_ht.rsplit(".", 1)[:-1]) + ".txt"}', header = None)
