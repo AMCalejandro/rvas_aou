@@ -92,7 +92,7 @@ def compute_scallion_scores(
         b = missense_betas[i, :]
         se = missense_ses[i, :]
 
-        ok = np.isfinite(b) & np.isfinite(se) & np.isfinite(beta_lof)
+        ok = np.isfinite(b) & np.isfinite(se) & np.isfinite(beta_lof) & (se > 0) 
         if mask_missing:
             idx = np.where(ok)[0]
         else:
