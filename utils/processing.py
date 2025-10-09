@@ -116,31 +116,64 @@ def get_gene_phenotype_correlations(ht, phenos_cor_path: str, gene: str):
 
 def filter_variant_matrix(var_path: str, gene: str, pheno_coding_keys, save_path: str):
     """Filter variant-level matrix for given gene and pheno_coding_keys."""
-    var_mt = hl.read_matrix_table(var_path).key_cols_by()
-
-    var_mt_filtered = var_mt.filter_cols(
+    var_mt = hl.read_matrix_table(var_path)
+    
+    var_mt_filtered = hl.filter_intervals(
+        var_mt, 
+        hl.experimental.get_gene_intervals(gene_symbols=[gene], reference_genome='GRCh38') 
+    )
+    
+    var_mt_filtered = var_mt_filtered.filter_cols(
         hl.literal(pheno_coding_keys).contains(
-            hl.struct(phenocode=var_mt.phenocode, coding=var_mt.coding)
+            hl.struct(phenocode=var_mt_filtered.phenocode, coding=var_mt_filtered.coding)
         )
     )
-
+    
     missense_annots = ["missense"]
+    plof_annots = ["pLoF"]
     var_mt_filtered = var_mt_filtered.filter_rows(
         (var_mt_filtered.gene == gene)
-        & (hl.literal(missense_annots).contains(var_mt_filtered.annotation))
+        & (hl.literal(missense_annots + plof_annots).contains(var_mt_filtered.annotation))
     )
-
     var_mt_filtered_ht = var_mt_filtered.entries()
-    var_mt_filtered_ht = var_mt_filtered_ht.naive_coalesce(250)
+    var_mt_filtered_ht = var_mt_filtered_ht.naive_coalesce(150)
     var_mt_filtered_ht = var_mt_filtered_ht.checkpoint(save_path, overwrite=True)
+    var_mt_filtered_ht = var_mt_filtered_ht.key_by()
+    
+    var_missense = var_mt_filtered_ht.filter(
+        hl.literal(missense_annots).contains(var_mt_filtered_ht.annotation)
+    )
+    var_missense = var_missense.select("markerID", "phenocode", "coding", "BETA", "SE")
+    var_missense = var_missense.to_pandas()
 
-    var_missense = var_mt_filtered_ht.select(
-        "markerID", "phenocode", "coding", "BETA", "SE"
+    var_plof_entries = var_mt_filtered_ht.filter(
+        hl.literal(plof_annots).contains(var_mt_filtered_ht.annotation)
+    )
+    
+    var_plof = var_plof_entries.group_by(
+        var_plof_entries.phenocode, 
+        var_plof_entries.coding
+    ).aggregate(
+        # Inverse variance weights: w_i = 1/SE_i^2
+        # Weighted beta: sum(BETA_i * w_i) / sum(w_i)
+        # Weighted SE: sqrt(1 / sum(w_i))
+        sum_weights = hl.agg.sum(1.0 / (var_plof_entries.SE ** 2)),
+        weighted_beta_sum = hl.agg.sum(var_plof_entries.BETA / (var_plof_entries.SE ** 2)),
+        n_variants = hl.agg.count()
+    )
+    
+    var_plof = var_plof.annotate(
+        BETA_meta = var_plof.weighted_beta_sum / var_plof.sum_weights,
+        SE_meta = hl.sqrt(1.0 / var_plof.sum_weights)
     )
 
-    var_missense = var_missense.to_pandas().drop(columns=["locus", "alleles"])
-    
-    return var_mt_filtered_ht, var_missense
+    var_plof = var_plof.key_by()
+    var_plof = var_plof.select(
+        "phenocode", "coding", "BETA_meta", "SE_meta", "n_variants"
+    )
+    var_plof = var_plof.to_pandas()
+
+    return var_mt_filtered_ht, var_missense, var_plof
 
 
 def process_gene(
