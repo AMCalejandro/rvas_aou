@@ -50,18 +50,17 @@ def main(args):
         
         if args.test:
             plof_genes = plof_genes[:2]
-            print(f"TEST MODE: Processing first 3 genes only: {plof_genes}")
+            print(f"TEST MODE: Processing first {len(plof_genes)} genes only: {plof_genes}")
         else:
             print(f"Processing {len(plof_genes)} genes")
-
-            scan_results = hl.hadoop_ls('gs://aou_amc/scallion/results')
-            genes_done = [
-                os.path.basename(f['path']).replace('.csv', '')
-                for f in scan_results
-                if f['path'].endswith('.csv')
-                ]
-            plof_genes = [gene for gene in plof_genes if gene not in genes_done]
-            
+            if hl.hadoop_exists(results_prefix):
+                scan_results = hl.hadoop_ls(results_prefix)
+                genes_done = [
+                    os.path.basename(f['path']).replace('.csv', '')
+                    for f in scan_results
+                    if f['path'].endswith('.csv')
+                    ]
+                plof_genes = [gene for gene in plof_genes if gene not in genes_done]
 
         gene_ht_path = save_out_ht
         
