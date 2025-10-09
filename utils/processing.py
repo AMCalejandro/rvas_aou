@@ -154,11 +154,11 @@ def process_gene(
 
     temp_dir = 'gs://aou_tmp'
     hl.init(
-        master='local[32]',
+        master='local[4]',
         tmp_dir=temp_dir,
         gcs_requester_pays_configuration='aou-neale-gwas',
-        worker_memory="highmem",
-        worker_cores=8,
+        worker_memory="12g",
+        worker_cores=4,
         default_reference="GRCh38",
     )
     

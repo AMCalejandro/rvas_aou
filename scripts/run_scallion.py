@@ -68,9 +68,9 @@ def main(args):
         for gene in plof_genes:
             j = b.new_python_job(f'run_scallion_{gene}', attributes={"gene": gene})
             j.image("hailgenetics/hail:0.2.133-py3.11")
-            j.memory('highmem')
-            j.cpu(8)
-            j.env('PYSPARK_SUBMIT_ARGS', '--driver-memory 24g --executor-memory 24g pyspark-shell')
+            j.memory('standard')
+            j.cpu(4)
+            j.env('PYSPARK_SUBMIT_ARGS', '--driver-memory 12g --executor-memory 12g pyspark-shell')
             try:
                 j.call(process_gene,
                        gene,
