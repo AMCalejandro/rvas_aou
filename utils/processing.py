@@ -203,17 +203,31 @@ def process_gene(
     blof_pd = blof_pd.sort_values("phenocode")
 
     save_path = f"{results_prefix}/tmp/{gene}_variants.mt"
-    _, var_missense_pd = filter_variant_matrix(
+    _, var_missense_pd, var_plof_pd = filter_variant_matrix(
         var_path, gene, pheno_coding_keys, save_path
     )
+
     var_missense_pd = var_missense_pd.sort_values("phenocode")
+    var_plof_pd = var_plof_pd.sort_values("phenocode")
 
     assert (
         blof_pd.shape[0]
         == len(var_missense_pd.phenocode.unique())
+        == len(var_plof_pd.phenocode.unique())
         == pivot_matrix.shape[0]
-    )
+    ), "Row counts do not match across datasets."
     
+    assert (
+        list(var_plof_pd.phenocode) == list(var_missense_pd.phenocode.unique()) == list(pivot_matrix.index)
+    ), "Phenocode order mismatch between plof, missense, or pivot_matrix."
+    
+    ac_mean_missense = (
+        var_missense_pd
+        .groupby('markerID', as_index=False)['AC']
+        .mean()
+        .rename(columns={'AC': 'mean_AC'})
+    )
+
     missense_beta_pd = (
         var_missense_pd
         .pivot(index='markerID', columns='phenocode', values='BETA')
@@ -227,13 +241,15 @@ def process_gene(
 
     df_scores = compute_scallion_scores(
         gene = gene,
-        beta_lof=blof_pd["BETA_Burden"].values,
+        beta_lof=var_plof_pd['BETA_meta'].values,#blof_pd["BETA_Burden"].values,
         P=pivot_matrix,
         missense_betas=missense_beta_pd,
         missense_ses=missense_se_pd,
         mask_missing=True,
         min_traits=2,
     )
+
+    df_scores = df_scores.merge(ac_mean_missense, on='markerID', how='left')
 
     out_path = f"{results_prefix}/{gene}.csv"
     df_scores_ht = hl.Table.from_pandas(df_scores)
