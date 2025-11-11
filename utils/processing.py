@@ -227,7 +227,6 @@ def process_gene(
         .mean()
         .rename(columns={'AC': 'mean_AC'})
     )
-
     missense_beta_pd = (
         var_missense_pd
         .pivot(index='markerID', columns='phenocode', values='BETA')
@@ -242,6 +241,7 @@ def process_gene(
     df_scores = compute_scallion_scores(
         gene = gene,
         beta_lof=var_plof_pd['BETA_meta'].values,#blof_pd["BETA_Burden"].values,
+        se_lof=var_plof_pd['SE_meta'].values,
         P=pivot_matrix,
         missense_betas=missense_beta_pd,
         missense_ses=missense_se_pd,
