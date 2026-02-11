@@ -16,8 +16,9 @@ from lightgbm import LGBMClassifier
 from sklearn.metrics import (
     average_precision_score, roc_auc_score, f1_score, 
     precision_score, recall_score, confusion_matrix,
-    precision_recall_curve, roc_curve, compute_sample_weight
+    precision_recall_curve, roc_curve
 )
+from sklearn.utils.class_weight import compute_sample_weight
 from scipy.stats import spearmanr
 import warnings
 warnings.filterwarnings('ignore')
