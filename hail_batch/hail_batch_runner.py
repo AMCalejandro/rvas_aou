@@ -7,21 +7,20 @@ import argparse
 from urllib.parse import urlparse
 
 parser = argparse.ArgumentParser(
-    description='Run scallion model training on Hail Batch', 
-    prefix_chars='@'
+    description='Run scallion model training on Hail Batch'
 )
 parser.add_argument(
-    'models', 
+    '--models', 
     type=str, 
     help='Comma separated list of models to run (e.g., "XGBoost,LightGBM,Logistic Regression")'
 )
 parser.add_argument(
-    'input_data', 
+    '--input_data', 
     type=str, 
     help='Path to input training data (CSV/TSV file)'
 )
 parser.add_argument(
-    'output_folder', 
+    '--output_folder', 
     type=str, 
     help='Output folder for results'
 )
@@ -38,6 +37,12 @@ parser.add_argument(
     help='Path to file containing predictor column names (optional)'
 )
 parser.add_argument(
+    '--framework',
+    type=str,
+    default='binary',
+    help='Framework type (default: binary)'
+)
+parser.add_argument(
     '--n-folds',
     type=int,
     default=5,
@@ -48,12 +53,6 @@ parser.add_argument(
     type=int,
     default=42,
     help='Random state for reproducibility (default: 42)'
-)
-parser.add_argument(
-    '--framework',
-    type=str,
-    default='binary',
-    help='Framework type (default: binary)'
 )
 
 args = parser.parse_args()
