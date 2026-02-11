@@ -16,7 +16,7 @@ from lightgbm import LGBMClassifier
 from sklearn.metrics import (
     average_precision_score, roc_auc_score, f1_score, 
     precision_score, recall_score, confusion_matrix,
-    precision_recall_curve, roc_curve
+    precision_recall_curve, roc_curve, compute_sample_weight
 )
 from scipy.stats import spearmanr
 import warnings
@@ -231,7 +231,9 @@ class ClassifierBenchmark:
                 probability=True,
                 random_state=self.random_state
             ),
-            'Gaussian NB': GaussianNB(),
+            'Gaussian NB': GaussianNB(
+                var_smoothing=1e-8
+            )
         }
         
         return models
@@ -290,6 +292,12 @@ class ClassifierBenchmark:
         for train_idx, val_idx in skf.split(X, y):
             X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
             X_val = X.iloc[val_idx]
+
+            sample_weight = None
+            if model_name == "Gaussian NB":
+                sample_weight = compute_sample_weight(
+                    class_weight="balanced",
+                    y=y_train)
             
             # Scale features for non-tree models
             needs_scaling = model_name not in ['XGBoost', 'LightGBM', 'Random Forest',
@@ -298,7 +306,10 @@ class ClassifierBenchmark:
                 scaler = StandardScaler()
                 X_train_scaled = scaler.fit_transform(X_train)
                 X_val_scaled = scaler.transform(X_val)
-                model.fit(X_train_scaled, y_train)
+                if sample_weight is not None:
+                    model.fit(X_train_scaled, y_train, sample_weight=sample_weight)
+                else:
+                    model.fit(X_train_scaled, y_train)
                 y_pred_proba = model.predict_proba(X_val_scaled)[:, 1]
             else:
                 model.fit(X_train, y_train)
@@ -415,6 +426,12 @@ class ClassifierBenchmark:
             X_train, X_val = X_filtered.iloc[train_idx], X_filtered.iloc[val_idx]
             y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
             
+            sample_weight = None
+            if model_name == "Gaussian NB":
+                sample_weight = compute_sample_weight(
+                    class_weight="balanced",
+                    y=y_train)
+                
             # Scale if needed
             if needs_scaling:
                 scaler = StandardScaler()
@@ -422,7 +439,11 @@ class ClassifierBenchmark:
                 X_val_scaled = scaler.transform(X_val)
                 
                 # Train and predict
-                model.fit(X_train_scaled, y_train)
+                if sample_weight is not None:
+                    model.fit(X_train_scaled, y_train, sample_weight=sample_weight)
+                else:
+                    model.fit(X_train_scaled, y_train)
+
                 y_pred_proba = model.predict_proba(X_val_scaled)[:, 1]
                 y_pred = model.predict(X_val_scaled)
             else:
