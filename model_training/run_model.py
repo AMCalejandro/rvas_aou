@@ -441,7 +441,7 @@ def main():
         results = trainer.run_single_model(X, y, args.model_name)
         
         # Save results
-        # save_results(results, args.output_folder, args.model_name)
+        save_results(results, args.output_folder, args.model_name)
         
         print("\n" + "="*80)
         print("TRAINING COMPLETED SUCCESSFULLY")
