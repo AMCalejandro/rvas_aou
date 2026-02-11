@@ -123,8 +123,8 @@ for model in model_types:
     
     model_name = model.replace(" ", "-")
     b.write_output(j.ofile1, f'{output_folder}/{args.target_column}/{model_name}_results.json')
-    b.write_output(j.ofile2, f'{output_folder}/{model_name}_summary.txt')
-    b.write_output(j.ofile3, f'{output_folder}/{model_name}_metrics.csv')
+    b.write_output(j.ofile2, f'{output_folder}/{args.target_column}/{model_name}_summary.txt')
+    b.write_output(j.ofile3, f'{output_folder}/{args.target_column}/{model_name}_metrics.csv')
     print(f"Added job for model: {model}")
 
 print(f"\nSubmitting batch with {len(model_types)} model training jobs...")
