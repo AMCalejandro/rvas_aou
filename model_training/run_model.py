@@ -14,7 +14,7 @@ import numpy as np
 from typing import Dict, List, Tuple
 
 # Import the benchmark class (assuming it's in the same directory or package)
-from .classifier_benchmark import ClassifierBenchmark, MonotonicityEnforcer
+from .classifier_benchmark import ClassifierBenchmark, MonotonicityEnforcer, MonotonicityType
 
 def parse_arguments():
     """Parse command line arguments"""
@@ -144,9 +144,17 @@ class SingleModelTrainer(ClassifierBenchmark):
         print("MONOTONICITY ANALYSIS")
         print(f"{'='*80}")
         
-        features_to_use, correlations = self.verify_monotonicity_posthoc(
+        features_to_use, scores = self.verify_monotonicity_posthoc(
             X, y, model, model_name
         )
+        # features_to_use, scores = self.verify_monotonicity_posthoc( # This would be to enforce marginal monotonicity
+        #     X, y, model, model_name, 
+        #     monotonicity_type=MonotonicityType.MARGINAL
+        # )
+        # features_to_use, scores = self.verify_monotonicity_posthoc( # This would be to enforce conditional monotonicity
+        #     X, y, model, model_name,
+        #     monotonicity_type=MonotonicityType.CONDITIONAL
+        # )
         
         # Store monotonicity information
         monotonicity_info = {
@@ -156,7 +164,7 @@ class SingleModelTrainer(ClassifierBenchmark):
             'features_used': len(features_to_use),
             'features_list': features_to_use,
             'excluded_features': list(set(X.columns) - set(features_to_use)),
-            'correlations': correlations
+            'correlations': scores
         }
         
         # Evaluate model
@@ -242,6 +250,10 @@ def load_data(
         )
     
     # Check predictors
+    if predictors is None: # Mostl handled for a test run
+        predictors = [col for col in df.columns if col != target_column]
+
+
     missing_predictors = [col for col in predictors if col not in df.columns]
     if missing_predictors:
         raise ValueError(

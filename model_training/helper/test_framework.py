@@ -69,7 +69,7 @@ def test_single_model_training():
         y = df['target']
         
         trainer = SingleModelTrainer(n_folds=3, random_state=42)
-        results = trainer.run_single_model(X, y, "XGBoost")
+        results = trainer.run_single_model(X, y, "Logistic Regression")
         
         print("\n   ✓ Single model training successful!")
         print(f"   Average Precision: {results['model_performance']['avg_precision_mean']:.4f}")
@@ -125,7 +125,7 @@ def test_data_loading():
         df.to_csv(test_file, index=False)
         
         # Test loading
-        X, y = load_data(str(test_file), 'target')
+        X, y = load_data(str(test_file), 'target', None, 'binary' )
         
         print(f"\n   Loaded {len(X)} samples with {len(X.columns)} features")
         print(f"   Target has {y.sum()} positive samples")
