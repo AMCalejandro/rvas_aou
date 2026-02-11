@@ -98,10 +98,10 @@ for model in model_types:
     
     # Build the training command
     training_cmd = (
-        f'pixi run python model_training/run_model.py '
+        f'pixi run python -m model_training.run_model '
         f'{quote(model)} '
         f'{quote(training_data)} '
-        f'./output/'
+        f'./output/ '
         f'--target-column {quote(args.target_column)} '
     )
     
@@ -122,7 +122,7 @@ for model in model_types:
     j.command(f'mv ./output/metrics.csv {j.ofile3}')
     
     model_name = model.replace(" ", "-")
-    b.write_output(j.ofile1, f'{output_folder}/{model_name}_results.json')
+    b.write_output(j.ofile1, f'{output_folder}/{args.target_column}/{model_name}_results.json')
     b.write_output(j.ofile2, f'{output_folder}/{model_name}_summary.txt')
     b.write_output(j.ofile3, f'{output_folder}/{model_name}_metrics.csv')
     print(f"Added job for model: {model}")
