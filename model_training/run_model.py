@@ -284,7 +284,7 @@ def load_data(
     if framework == "binary":
         if not is_binary:
             print("Binary framework selected with continuous target.")
-            print("Binarizing target using threshold = 0.7")
+            print(f"Binarizing target using threshold = {bin_thresh}")
             y = (y > bin_thresh).astype(int)
         else:
             y = y.astype(int)
