@@ -61,6 +61,12 @@ def parse_arguments():
         required=False,
         help='Path to a text file containing predictor names (one per line)'
     )
+    parser.add_argument(
+        '--framework',
+        type=str,
+        default='binary',
+        help='Framework type (default: binary)'
+    )
 
     threshold_group = parser.add_mutually_exclusive_group()
     
