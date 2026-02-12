@@ -158,9 +158,9 @@ class SingleModelTrainer(ClassifierBenchmark):
         print("MONOTONICITY ANALYSIS")
         print(f"{'='*80}")
         
-        features_to_use, scores = self.verify_monotonicity_posthoc(
-            X, y, model, model_name
-        )
+        # features_to_use, scores = self.verify_monotonicity_posthoc(
+        #     X, y, model, model_name
+        # )
         # features_to_use, scores = self.verify_monotonicity_posthoc( # This would be to enforce marginal monotonicity
         #     X, y, model, model_name, 
         #     monotonicity_type=MonotonicityType.MARGINAL
@@ -171,15 +171,15 @@ class SingleModelTrainer(ClassifierBenchmark):
         # )
         
         # Store monotonicity information
-        monotonicity_info = {
-            'model': model_name,
-            'uses_native_monotonicity': self.uses_native_monotonicity(model_name),
-            'original_features': len(X.columns),
-            'features_used': len(features_to_use),
-            'features_list': features_to_use,
-            'excluded_features': list(set(X.columns) - set(features_to_use)),
-            'correlations': scores
-        }
+        # monotonicity_info = {
+        #     'model': model_name,
+        #     'uses_native_monotonicity': self.uses_native_monotonicity(model_name),
+        #     'original_features': len(X.columns),
+        #     'features_used': len(features_to_use),
+        #     'features_list': features_to_use,
+        #     'excluded_features': list(set(X.columns) - set(features_to_use)),
+        #     'correlations': scores
+        # }
         
         # Evaluate model
         print(f"\n{'='*80}")
@@ -189,7 +189,7 @@ class SingleModelTrainer(ClassifierBenchmark):
         import time
         start_time = time.time()
         
-        results = self.evaluate_model_cv(X, y, model, model_name, features_to_use)
+        results = self.evaluate_model_cv(X, y, model, model_name)
         
         elapsed_time = time.time() - start_time
         results['training_time'] = elapsed_time
@@ -197,7 +197,6 @@ class SingleModelTrainer(ClassifierBenchmark):
         # Combine results
         complete_results = {
             'model_performance': results,
-            'monotonicity_info': monotonicity_info,
             'dataset_info': {
                 'n_samples': len(X),
                 'n_features': len(X.columns),
@@ -213,7 +212,6 @@ class SingleModelTrainer(ClassifierBenchmark):
         print("FINAL RESULTS SUMMARY")
         print(f"{'='*80}")
         print(f"\nModel: {model_name}")
-        print(f"Features Used: {len(features_to_use)} / {len(X.columns)}")
         print(f"\nPerformance Metrics:")
         print(f"  Average Precision: {results['avg_precision_mean']:.4f} ± {results['avg_precision_std']:.4f}")
         print(f"  ROC-AUC: {results['roc_auc_mean']:.4f} ± {results['roc_auc_std']:.4f}")
