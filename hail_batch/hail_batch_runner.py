@@ -44,7 +44,7 @@ parser.add_argument(
 )
 parser.add_argument(
     '--bin-threshold',
-    type=int,
+    type=float,
     default=0.7,
     help='This the threshold to binarize the target variables'
 )
