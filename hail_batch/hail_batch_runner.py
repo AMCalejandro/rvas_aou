@@ -123,11 +123,14 @@ for model in model_types:
     
     training_cmd += (
         f'--framework {quote(args.framework)} '
-        f'--bin-threshold {args.bin_threshold} '
-        f'--top-percent {args.top_percent} '
         f'--n-folds {args.n_folds} '
-        f'--random-state {args.random_state}'
+        f'--random-state {args.random_state} '
     )
+
+    if args.bin_threshold is not None:
+        training_cmd += f'--bin-threshold {args.bin_threshold} '
+    if args.top_percent is not None:
+        training_cmd += f'--top-percent {args.top_percent} '
     
     j.command(training_cmd)
     
