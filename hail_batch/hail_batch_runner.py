@@ -42,11 +42,18 @@ parser.add_argument(
     default='binary',
     help='Framework type (default: binary)'
 )
-parser.add_argument(
+threshold_group = parser.add_mutually_exclusive_group()
+threshold_group.add_argument(
     '--bin-threshold',
     type=float,
-    default=0.7,
-    help='This the threshold to binarize the target variables'
+    default=None,
+    help='Absolute threshold to binarize the target variable (e.g. 0.7)'
+)
+threshold_group.add_argument(
+    '--top-percent',
+    type=float,
+    default=None,
+    help='Use top N%% of values as class 1 (e.g. 5 for top 5%%)'
 )
 parser.add_argument(
     '--n-folds',
@@ -117,6 +124,7 @@ for model in model_types:
     training_cmd += (
         f'--framework {quote(args.framework)} '
         f'--bin-threshold {args.bin_threshold} '
+        f'--top-percent {args.top_percent} '
         f'--n-folds {args.n_folds} '
         f'--random-state {args.random_state}'
     )

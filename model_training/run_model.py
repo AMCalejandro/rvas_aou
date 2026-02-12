@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 # Import the benchmark class (assuming it's in the same directory or package)
 from .classifier_benchmark import ClassifierBenchmark, MonotonicityEnforcer, MonotonicityType
@@ -62,12 +62,20 @@ def parse_arguments():
         help='Path to a text file containing predictor names (one per line)'
     )
 
-    parser.add_argument(
-        '--framework',
-        type=str,
-        choices=['continuous', 'binary'],
-        required=True,
-        help='Modeling framework: "continuous" or "binary"'
+    threshold_group = parser.add_mutually_exclusive_group()
+    
+    threshold_group.add_argument(
+        '--bin-threshold',
+        type=float,
+        default=None,
+        help='Absolute threshold to binarize the target variable (e.g. 0.7)'
+    )
+
+    threshold_group.add_argument(
+        '--top-percent',
+        type=float,
+        default=None,
+        help='Use top N%% of values as class 1 (e.g. 5 for top 5%%)'
     )
 
     parser.add_argument(
@@ -222,25 +230,27 @@ def load_data(
     target_column: str,
     predictors: List[str],
     framework: str,
-    bin_thresh: int,
+    bin_thresh: Optional[float] = None,
+    top_percent: Optional[float] = None,
     sep: str = ','
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """
     Load training data from file and prepare features/target.
-    
+
     Args:
         input_path: Path to input CSV/TSV file
         target_column: Name of target column
         predictors: List of predictor column names
         framework: "continuous" or "binary"
+        bin_thresh: Absolute threshold for binarization
+        top_percent: Use top N% of values as class 1 (e.g. 5 for top 5%)
         sep: Delimiter
-        
+    
     Returns:
         Tuple of (X, y)
     """
     print(f"Loading data from: {input_path}")
     
-    # Determine file type and load
     if input_path.endswith('.csv'):
         df = pd.read_csv(input_path)
     elif input_path.endswith('.tsv'):
@@ -250,43 +260,60 @@ def load_data(
     
     print(f"Loaded {len(df)} rows, {len(df.columns)} columns")
     
-    # Check target column
     if target_column not in df.columns:
         raise ValueError(
             f"Target column '{target_column}' not found in data. "
             f"Available columns: {list(df.columns)}"
         )
     
-    # Check predictors
-    if predictors is None: # Mostl handled for a test run
+    if predictors is None:
         predictors = [col for col in df.columns if col != target_column]
-
-
+    
     missing_predictors = [col for col in predictors if col not in df.columns]
     if missing_predictors:
-        raise ValueError(
-            f"Predictors not found in data: {missing_predictors}"
-        )
+        raise ValueError(f"Predictors not found in data: {missing_predictors}")
     
-    # Extract X and y
     X = df[predictors].copy()
     y = df[target_column].copy()
     
-    # -------------------------
-    # Framework handling
-    # -------------------------
     if framework not in ["continuous", "binary"]:
         raise ValueError("framework must be either 'continuous' or 'binary'")
-    
+
     unique_vals = set(y.dropna().unique())
     is_binary = unique_vals.issubset({0, 1})
 
     if framework == "binary":
+
+        if bin_thresh is not None and top_percent is not None:
+            raise ValueError("Use either bin_thresh OR top_percent, not both.")
+
         if not is_binary:
             print("Binary framework selected with continuous target.")
-            print(f"Binarizing target using threshold = {bin_thresh}")
-            y = (y > bin_thresh).astype(int)
+
+            # --- Absolute threshold ---
+            if bin_thresh is not None:
+                print(f"Binarizing using absolute threshold = {bin_thresh}")
+                y = (y > bin_thresh).astype(int)
+
+            # --- Top N% threshold ---
+            elif top_percent is not None:
+                if not (0 < top_percent < 100):
+                    raise ValueError("top_percent must be between 0 and 100")
+                
+                percentile_cutoff = np.percentile(y.dropna(), 100 - top_percent)
+
+                print(f"Binarizing using top {top_percent}%")
+                print(f"Percentile cutoff value = {percentile_cutoff:.6f}")
+
+                y = (y >= percentile_cutoff).astype(int)
+
+            else:
+                raise ValueError(
+                    "For binary framework with continuous target, "
+                    "provide either bin_thresh or top_percent."
+                )
         else:
+            print("Target already binary.")
             y = y.astype(int)
 
     elif framework == "continuous":
@@ -297,8 +324,9 @@ def load_data(
 
     print(f"Using {len(X.columns)} predictors")
     print(f"Target: {target_column}")
-    print(f"Target distribution:\n{y.value_counts(normalize=True)}")
-    
+    print("Target distribution:")
+    print(y.value_counts(normalize=True))
+
     return X, y
 
 
@@ -438,7 +466,7 @@ def main():
             if args.predictors_file
             else args.predictors
         )
-        X, y = load_data(args.input_data, args.target_column, predictors, args.framework, args.bin_threshold, args.sep)
+        X, y = load_data(args.input_data, args.target_column, predictors, args.framework, args.bin_threshold, args.top_percent, args.sep)
 
         # Initialize trainer
         trainer = SingleModelTrainer(
