@@ -400,12 +400,6 @@ def save_results(results: Dict, output_folder: str, model_name: str):
         
         f.write("MONOTONICITY INFORMATION\n")
         f.write("-"*80 + "\n")
-        mono_info = results['monotonicity_info']
-        f.write(f"Uses native monotonicity: {mono_info['uses_native_monotonicity']}\n")
-        f.write(f"Features used: {mono_info['features_used']} / {mono_info['original_features']}\n")
-        if mono_info['excluded_features']:
-            f.write(f"Excluded features: {mono_info['excluded_features']}\n")
-        f.write("\n")
         
         f.write("PERFORMANCE METRICS\n")
         f.write("-"*80 + "\n")
