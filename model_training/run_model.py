@@ -415,7 +415,6 @@ def save_results(results: Dict, output_folder: str, model_name: str):
     
     # Save CSV with key metrics
     perf = results['model_performance']
-    mono_info = results['monotonicity_info']
     metrics_df = pd.DataFrame([{
         'model': model_name,
         'avg_precision_mean': perf['avg_precision_mean'],
@@ -427,7 +426,6 @@ def save_results(results: Dict, output_folder: str, model_name: str):
         'precision_mean': perf['precision_mean'],
         'recall_mean': perf['recall_mean'],
         'training_time': perf['training_time'],
-        'n_features_used': mono_info['features_used']
     }])
     metrics_df.to_csv(csv_path, index=False)
     print(f"Metrics CSV saved to: {csv_path}")
