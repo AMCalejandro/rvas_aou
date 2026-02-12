@@ -71,6 +71,13 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        '--bin-threshold',
+        type=int,
+        default=0.7,
+        help='This the threshold to binarize the target variables'
+    )
+
+    parser.add_argument(
         '--n-folds',
         type=int,
         default=5,
@@ -215,6 +222,7 @@ def load_data(
     target_column: str,
     predictors: List[str],
     framework: str,
+    bin_thresh: int,
     sep: str = ','
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """
@@ -277,7 +285,7 @@ def load_data(
         if not is_binary:
             print("Binary framework selected with continuous target.")
             print("Binarizing target using threshold = 0.7")
-            y = (y > 0.7).astype(int)
+            y = (y > bin_thresh).astype(int)
         else:
             y = y.astype(int)
 
@@ -418,6 +426,7 @@ def main():
     print(f"  Input data: {args.input_data}")
     print(f"  Output folder: {args.output_folder}")
     print(f"  Target column: {args.target_column}")
+    print(f" The threshold for binarization {args.bin_threshold}")
     print(f"  CV folds: {args.n_folds}")
     print(f"  Random state: {args.random_state}")
     print()
@@ -429,7 +438,7 @@ def main():
             if args.predictors_file
             else args.predictors
         )
-        X, y = load_data(args.input_data, args.target_column, predictors, args.framework, args.sep)
+        X, y = load_data(args.input_data, args.target_column, predictors, args.framework, args.bin_threshold, args.sep)
 
         # Initialize trainer
         trainer = SingleModelTrainer(

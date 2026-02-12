@@ -43,6 +43,12 @@ parser.add_argument(
     help='Framework type (default: binary)'
 )
 parser.add_argument(
+    '--bin-threshold',
+    type=int,
+    default=0.7,
+    help='This the threshold to binarize the target variables'
+)
+parser.add_argument(
     '--n-folds',
     type=int,
     default=5,
@@ -110,6 +116,7 @@ for model in model_types:
     
     training_cmd += (
         f'--framework {quote(args.framework)} '
+        f'--bin-threshold {args.bin_threshold} '
         f'--n-folds {args.n_folds} '
         f'--random-state {args.random_state}'
     )
