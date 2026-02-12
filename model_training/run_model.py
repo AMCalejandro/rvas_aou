@@ -194,7 +194,7 @@ class SingleModelTrainer(ClassifierBenchmark):
         elapsed_time = time.time() - start_time
         results['training_time'] = elapsed_time
         
-        # Combine results
+        # Combine results - NOW INCLUDING ALL FIELDS FROM evaluate_model_cv
         complete_results = {
             'model_performance': results,
             'dataset_info': {
@@ -204,6 +204,14 @@ class SingleModelTrainer(ClassifierBenchmark):
                 'n_positive': int(y.sum()),
                 'n_negative': int((~y.astype(bool)).sum()),
                 'positive_rate': float(y.sum() / len(y))
+            },
+            'monotonicity_info': {
+                'uses_native_monotonicity': results.get('uses_native_monotonicity', False),
+                'n_monotonic_features': results.get('n_monotonic_features', len(X.columns)),
+                'monotonic_features': results.get('monotonic_features', list(X.columns)),
+                'monotonic_feature_frequency': results.get('monotonic_feature_frequency', {}),
+                'n_features_mean': results.get('n_features_mean', len(X.columns)),
+                'n_features_std': results.get('n_features_std', 0.0)
             }
         }
         
@@ -218,6 +226,10 @@ class SingleModelTrainer(ClassifierBenchmark):
         print(f"  F1 Score: {results['f1_score_mean']:.4f} ± {results['f1_score_std']:.4f}")
         print(f"  Precision: {results['precision_mean']:.4f} ± {results['precision_std']:.4f}")
         print(f"  Recall: {results['recall_mean']:.4f} ± {results['recall_std']:.4f}")
+        print(f"\nMonotonicity Information:")
+        print(f"  Uses native monotonicity: {results.get('uses_native_monotonicity', False)}")
+        print(f"  Monotonic features: {results.get('n_monotonic_features', len(X.columns))}/{len(X.columns)}")
+        print(f"  Average features per fold: {results.get('n_features_mean', len(X.columns)):.1f} ± {results.get('n_features_std', 0):.1f}")
         print(f"\nTraining Time: {elapsed_time:.2f}s")
         
         return complete_results
@@ -384,7 +396,7 @@ def save_results(results: Dict, output_folder: str, model_name: str):
     
     print(f"\nResults saved to: {json_path}")
     
-    # Save summary text file
+    # Save summary text file with ENHANCED monotonicity information
     with open(summary_path, 'w') as f:
         f.write("="*80 + "\n")
         f.write(f"MODEL TRAINING RESULTS: {model_name}\n")
@@ -400,6 +412,25 @@ def save_results(results: Dict, output_folder: str, model_name: str):
         
         f.write("MONOTONICITY INFORMATION\n")
         f.write("-"*80 + "\n")
+        mono_info = results['monotonicity_info']
+        f.write(f"Uses native monotonicity: {mono_info['uses_native_monotonicity']}\n")
+        f.write(f"Stable monotonic features: {mono_info['n_monotonic_features']}/{dataset_info['n_features']}\n")
+        f.write(f"Average features per fold: {mono_info['n_features_mean']:.1f} ± {mono_info['n_features_std']:.1f}\n")
+        
+        if mono_info['monotonic_features']:
+            f.write(f"\nMonotonic features (stable across >=50% of folds):\n")
+            for feat in sorted(mono_info['monotonic_features']):
+                freq = mono_info['monotonic_feature_frequency'].get(feat, 1.0)
+                f.write(f"  - {feat} (selected in {freq*100:.0f}% of folds)\n")
+        
+        excluded_features = set(dataset_info['feature_names']) - set(mono_info['monotonic_features'])
+        if excluded_features:
+            f.write(f"\nExcluded features (non-monotonic or unstable):\n")
+            for feat in sorted(excluded_features):
+                freq = mono_info['monotonic_feature_frequency'].get(feat, 0.0)
+                f.write(f"  - {feat} (selected in {freq*100:.0f}% of folds)\n")
+        
+        f.write("\n")
         
         f.write("PERFORMANCE METRICS\n")
         f.write("-"*80 + "\n")
@@ -409,12 +440,18 @@ def save_results(results: Dict, output_folder: str, model_name: str):
         f.write(f"F1 Score: {perf['f1_score_mean']:.4f} ± {perf['f1_score_std']:.4f}\n")
         f.write(f"Precision: {perf['precision_mean']:.4f} ± {perf['precision_std']:.4f}\n")
         f.write(f"Recall: {perf['recall_mean']:.4f} ± {perf['recall_std']:.4f}\n")
+        f.write(f"\nConfusion Matrix (averaged):\n")
+        f.write(f"  True Negatives:  {perf['tn_mean']:.1f}\n")
+        f.write(f"  False Positives: {perf['fp_mean']:.1f}\n")
+        f.write(f"  False Negatives: {perf['fn_mean']:.1f}\n")
+        f.write(f"  True Positives:  {perf['tp_mean']:.1f}\n")
         f.write(f"\nTraining time: {perf['training_time']:.2f}s\n")
     
     print(f"Summary saved to: {summary_path}")
     
-    # Save CSV with key metrics
+    # Save CSV with key metrics - ENHANCED with monotonicity info
     perf = results['model_performance']
+    mono_info = results['monotonicity_info']
     metrics_df = pd.DataFrame([{
         'model': model_name,
         'avg_precision_mean': perf['avg_precision_mean'],
@@ -426,6 +463,10 @@ def save_results(results: Dict, output_folder: str, model_name: str):
         'precision_mean': perf['precision_mean'],
         'recall_mean': perf['recall_mean'],
         'training_time': perf['training_time'],
+        'uses_native_monotonicity': mono_info['uses_native_monotonicity'],
+        'n_monotonic_features': mono_info['n_monotonic_features'],
+        'n_features_mean': mono_info['n_features_mean'],
+        'n_features_std': mono_info['n_features_std'],
     }])
     metrics_df.to_csv(csv_path, index=False)
     print(f"Metrics CSV saved to: {csv_path}")
