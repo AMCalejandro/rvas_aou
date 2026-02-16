@@ -2,6 +2,7 @@
 """
 Single model training script for Hail Batch execution.
 Trains a specific classifier with monotonicity constraints.
+Saves the final trained model as a pickle file.
 """
 
 import argparse
@@ -12,9 +13,12 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional
+import pickle
 
-# Import the benchmark class (assuming it's in the same directory or package)
-from .classifier_benchmark import ClassifierBenchmark, MonotonicityEnforcer, MonotonicityType
+from classifier_benchmark import ClassifierBenchmark, MonotonicityEnforcer, MonotonicityType
+from sklearn.preprocessing import StandardScaler
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.base import clone
 
 def parse_arguments():
     """Parse command line arguments"""
@@ -153,35 +157,6 @@ class SingleModelTrainer(ClassifierBenchmark):
         else:
             print(f"  Method: Post-hoc feature filtering")
         
-        # Verify monotonicity and get features to use
-        print(f"\n{'='*80}")
-        print("MONOTONICITY ANALYSIS")
-        print(f"{'='*80}")
-        
-        # features_to_use, scores = self.verify_monotonicity_posthoc(
-        #     X, y, model, model_name
-        # )
-        # features_to_use, scores = self.verify_monotonicity_posthoc( # This would be to enforce marginal monotonicity
-        #     X, y, model, model_name, 
-        #     monotonicity_type=MonotonicityType.MARGINAL
-        # )
-        # features_to_use, scores = self.verify_monotonicity_posthoc( # This would be to enforce conditional monotonicity
-        #     X, y, model, model_name,
-        #     monotonicity_type=MonotonicityType.CONDITIONAL
-        # )
-        
-        # Store monotonicity information
-        # monotonicity_info = {
-        #     'model': model_name,
-        #     'uses_native_monotonicity': self.uses_native_monotonicity(model_name),
-        #     'original_features': len(X.columns),
-        #     'features_used': len(features_to_use),
-        #     'features_list': features_to_use,
-        #     'excluded_features': list(set(X.columns) - set(features_to_use)),
-        #     'correlations': scores
-        # }
-        
-        # Evaluate model
         print(f"\n{'='*80}")
         print("CROSS-VALIDATION EVALUATION")
         print(f"{'='*80}")
@@ -194,7 +169,6 @@ class SingleModelTrainer(ClassifierBenchmark):
         elapsed_time = time.time() - start_time
         results['training_time'] = elapsed_time
         
-        # Combine results - NOW INCLUDING ALL FIELDS FROM evaluate_model_cv
         complete_results = {
             'model_performance': results,
             'dataset_info': {
@@ -233,6 +207,74 @@ class SingleModelTrainer(ClassifierBenchmark):
         print(f"\nTraining Time: {elapsed_time:.2f}s")
         
         return complete_results
+    
+    def train_final_model(self, X: pd.DataFrame, y: pd.Series, 
+                         model_name: str, 
+                         monotonic_features: List[str]) -> Tuple[object, Optional[StandardScaler]]:
+        """
+        Train final model on all data using the monotonic features identified during CV.
+        
+        Args:
+            X: Full feature matrix
+            y: Full target vector
+            model_name: Name of the model to train
+            monotonic_features: List of features to use (from CV results)
+            
+        Returns:
+            Tuple of (trained_model, scaler) where scaler is None if not needed
+        """
+        print(f"\n{'='*80}")
+        print("TRAINING FINAL MODEL ON ALL DATA")
+        print(f"{'='*80}")
+        
+        feature_names = list(X.columns)
+        models = self.get_models(feature_names)
+        final_model = clone(models[model_name])
+        
+        # Use monotonic features identified during CV
+        X_filtered = X[monotonic_features].copy()
+        
+        print(f"Using {len(monotonic_features)} monotonic features")
+        print(f"Features: {monotonic_features}")
+        
+        # Handle class imbalance for tree models
+        n_pos = np.sum(y == 1)
+        n_neg = np.sum(y == 0)
+        scale_pos_weight = n_neg / max(n_pos, 1)
+        
+        if model_name in ['XGBoost', 'XGBoost (Deep)']:
+            final_model.set_params(scale_pos_weight=scale_pos_weight)
+        
+        if model_name in ['LightGBM', 'LightGBM (Deep)']:
+            final_model.set_params(scale_pos_weight=scale_pos_weight)
+        
+        # Check if model needs scaling
+        needs_scaling = model_name not in ['XGBoost', 'LightGBM', 'Random Forest',
+                                            'XGBoost (Deep)', 'LightGBM (Deep)']
+        
+        scaler = None
+        if needs_scaling:
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X_filtered)
+            
+            if model_name == "Linear SVM":
+                # Train and calibrate Linear SVM
+                final_model.fit(X_scaled, y)
+                calibrator = CalibratedClassifierCV(
+                    estimator=final_model,
+                    method="sigmoid",
+                    cv=3
+                )
+                calibrator.fit(X_scaled, y)
+                final_model = calibrator
+            else:
+                final_model.fit(X_scaled, y)
+        else:
+            final_model.fit(X_filtered, y)
+        
+        print("Final model training completed")
+        
+        return final_model, scaler
 
 def load_data(
     input_path: str,
@@ -472,6 +514,58 @@ def save_results(results: Dict, output_folder: str, model_name: str):
     print(f"Metrics CSV saved to: {csv_path}")
 
 
+def save_model(model: object, scaler: Optional[StandardScaler], 
+               monotonic_features: List[str], model_name: str,
+               output_folder: str):
+    """
+    Save trained model, scaler, and feature list as pickle files.
+    
+    Args:
+        model: Trained model
+        scaler: Fitted scaler (or None)
+        monotonic_features: List of features used
+        model_name: Name of the model
+        output_folder: Path to output folder
+    """
+    output_path = Path(output_folder)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Save model
+    model_path = output_path / 'model.pkl'
+    with open(model_path, 'wb') as f:
+        pickle.dump(model, f)
+    print(f"Model saved to: {model_path}")
+    
+    # Save scaler if it exists
+    if scaler is not None:
+        scaler_path = output_path / 'scaler.pkl'
+        with open(scaler_path, 'wb') as f:
+            pickle.dump(scaler, f)
+        print(f"Scaler saved to: {scaler_path}")
+    
+    # Save feature list and metadata
+    model_metadata = {
+        'model_name': model_name,
+        'monotonic_features': monotonic_features,
+        'n_features': len(monotonic_features),
+        'uses_scaler': scaler is not None,
+    }
+    
+    metadata_path = output_path / 'model_metadata.json'
+    with open(metadata_path, 'w') as f:
+        json.dump(model_metadata, f, indent=2)
+    print(f"Model metadata saved to: {metadata_path}")
+    
+    # Save features list as text file for easy reference
+    features_path = output_path / 'features.txt'
+    with open(features_path, 'w') as f:
+        f.write("# Features used in the final model (monotonic features)\n")
+        f.write("# One feature per line\n\n")
+        for feat in monotonic_features:
+            f.write(f"{feat}\n")
+    print(f"Feature list saved to: {features_path}")
+
+
 def main():
     """Main execution function"""
     args = parse_arguments()
@@ -484,7 +578,8 @@ def main():
     print(f"  Input data: {args.input_data}")
     print(f"  Output folder: {args.output_folder}")
     print(f"  Target column: {args.target_column}")
-    print(f" The threshold for binarization {args.bin_threshold}")
+    print(f"  Bin threshold: {args.bin_threshold}")
+    print(f"  Top percent: {args.top_percent}")
     print(f"  CV folds: {args.n_folds}")
     print(f"  Random state: {args.random_state}")
     print()
@@ -496,7 +591,8 @@ def main():
             if args.predictors_file
             else args.predictors
         )
-        X, y = load_data(args.input_data, args.target_column, predictors, args.framework, args.bin_threshold, args.top_percent, args.sep)
+        X, y = load_data(args.input_data, args.target_column, predictors, 
+                        args.framework, args.bin_threshold, args.top_percent, args.sep)
 
         # Initialize trainer
         trainer = SingleModelTrainer(
@@ -504,15 +600,33 @@ def main():
             random_state=args.random_state
         )
         
-        # Run training for single model
+        # Run training for single model (CV evaluation)
         results = trainer.run_single_model(X, y, args.model_name)
         
-        # Save results
+        # Get monotonic features from CV results
+        monotonic_features = results['monotonicity_info']['monotonic_features']
+        
+        # Train final model on all data
+        final_model, scaler = trainer.train_final_model(
+            X, y, args.model_name, monotonic_features
+        )
+        
         save_results(results, args.output_folder, args.model_name)
+        save_model(final_model, scaler, monotonic_features, 
+                   args.model_name, args.output_folder)
         
         print("\n" + "="*80)
         print("TRAINING COMPLETED SUCCESSFULLY")
         print("="*80)
+        print(f"\nOutput files in {args.output_folder}:")
+        print("  - results.json (full results)")
+        print("  - summary.txt (human-readable summary)")
+        print("  - metrics.csv (key metrics)")
+        print("  - model.pkl (trained model)")
+        if scaler is not None:
+            print("  - scaler.pkl (fitted scaler)")
+        print("  - model_metadata.json (model info)")
+        print("  - features.txt (feature list)")
         
         return 0
         
