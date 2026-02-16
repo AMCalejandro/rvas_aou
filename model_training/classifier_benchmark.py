@@ -226,7 +226,7 @@ class ClassifierBenchmark:
             ),
             # Non-tree models (will use post-hoc feature filtering)
             'Logistic Regression': LogisticRegression(
-                class_weight='balanced',
+                # class_weight='balanced',
                 max_iter=1000,
                 random_state=self.random_state,
                 # solver='lbfgs',
@@ -234,14 +234,14 @@ class ClassifierBenchmark:
                 C=1.0
             ),
             'Random Forest': RandomForestClassifier(
-                class_weight='balanced',
-               n_estimators=400,
+                # class_weight='balanced',
+                n_estimators=400,
                 max_depth=10,
                 random_state=self.random_state,
                 n_jobs=-1
             ),
             'Linear SVM': LinearSVC(
-                class_weight='balanced',
+                # class_weight='balanced',
                 random_state=self.random_state,
                 max_iter=5000
             ),
@@ -316,15 +316,15 @@ class ClassifierBenchmark:
             # --------------------------------------------------
             # Step 1: Handle imbalance for tree models
             # --------------------------------------------------
-            n_pos = np.sum(y_train == 1)
-            n_neg = np.sum(y_train == 0)
-            scale_pos_weight = n_neg / max(n_pos, 1)
+            # n_pos = np.sum(y_train == 1)
+            # n_neg = np.sum(y_train == 0)
+            # scale_pos_weight = n_neg / max(n_pos, 1)
 
-            if model_name in ['XGBoost', 'XGBoost (Deep)']:
-                model_fold.set_params(scale_pos_weight=scale_pos_weight)
+            # if model_name in ['XGBoost', 'XGBoost (Deep)']:
+            #     model_fold.set_params(scale_pos_weight=scale_pos_weight)
 
-            if model_name in ['LightGBM', 'LightGBM (Deep)']:
-                model_fold.set_params(scale_pos_weight=scale_pos_weight)
+            # if model_name in ['LightGBM', 'LightGBM (Deep)']:
+            #     model_fold.set_params(scale_pos_weight=scale_pos_weight)
 
             # --------------------------------------------------
             # Step 2: Nested Monotonic Feature Selection
