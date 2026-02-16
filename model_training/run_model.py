@@ -15,7 +15,7 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 import pickle
 
-from classifier_benchmark import ClassifierBenchmark, MonotonicityEnforcer, MonotonicityType
+from .classifier_benchmark import ClassifierBenchmark, MonotonicityEnforcer, MonotonicityType
 from sklearn.preprocessing import StandardScaler
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.base import clone
