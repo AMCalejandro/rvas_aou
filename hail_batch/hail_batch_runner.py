@@ -90,6 +90,11 @@ b = hb.Batch(
 
 training_data = b.read_input(args.input_data)
 
+def model_requires_scaler(model_name: str) -> bool:
+    no_scaler_models = {'XGBoost', 'LightGBM', 'Random Forest',
+                        'XGBoost (Deep)', 'LightGBM (Deep)',}
+    return model_name not in no_scaler_models
+
 predictors_file = None
 if args.predictors_file:
     predictors_file = b.read_input(args.predictors_file)
@@ -139,11 +144,19 @@ for model in model_types:
     j.command(f'mv ./output/summary.txt {j.ofile2}')
     j.command(f'mv ./output/metrics.csv {j.ofile3}')
     
+    j.command(f'mv ./output/model.pkl {j.ofile4}')
+    j.command(f'mv ./output/model_metadata.json {j.ofile5}')
+    
     model_name = model.replace(" ", "-")
     b.write_output(j.ofile1, f'{output_folder}/{args.target_column}/{model_name}_results.json')
     b.write_output(j.ofile2, f'{output_folder}/{args.target_column}/{model_name}_summary.txt')
     b.write_output(j.ofile3, f'{output_folder}/{args.target_column}/{model_name}_metrics.csv')
-    print(f"Added job for model: {model}")
+    b.write_output(j.ofile4, f'{output_folder}/{args.target_column}/models/{model_name}.pkl')
+    b.write_output(j.ofile5, f'{output_folder}/{args.target_column}/models/{model_name}_metadata.json')
+    
+    if model_requires_scaler(model):
+        j.command(f'mv ./output/scaler.pkl {j.ofile6}')
+        b.write_output(j.ofile6, f'{output_folder}/{args.target_column}/models/{model_name}_scaler.pkl')
 
 print(f"\nSubmitting batch with {len(model_types)} model training jobs...")
 b.run()
