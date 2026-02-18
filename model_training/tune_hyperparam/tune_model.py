@@ -445,7 +445,7 @@ class HyperparameterTuner(SingleModelTrainer):
             n_trials=self.n_trials,
             timeout=self.timeout,
             show_progress_bar=True,
-            n_jobs=1,
+            n_jobs=-1
         )
 
         tuning_time = time.time() - t0
