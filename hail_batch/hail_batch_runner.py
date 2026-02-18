@@ -110,11 +110,6 @@ for model in model_types:
     j._machine_type = config['model-training']['machine-type']
     j.storage('10Gi')  # Sufficient for pixi, model, and outputs
     
-    # j.command('apt update')
-    # j.command('apt install -y git curl moreutils')
-    # j.command('curl -fsSL https://pixi.sh/install.sh | sh')
-    # j.command('export PATH=/root/.pixi/bin:$PATH')
-    
     j.command('git clone -b scallion-interpretation https://github.com/AMCalejandro/rvas_aou.git')
     j.command('cd rvas_aou')
     j.command('pixi install')
