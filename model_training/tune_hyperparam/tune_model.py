@@ -156,11 +156,17 @@ def build_model(model_name: str, params: Dict, n_features: int,
         )
 
     if model_name == "Logistic Regression":
-        # l1_ratio is only meaningful for elasticnet; passing it to other
-        # solvers raises an error, so we guard it here.
         p = dict(params)
-        if p.get("penalty") != "elasticnet":
+        penalty = p.get("penalty", "l2")
+        if penalty != "elasticnet":
             p.pop("l1_ratio", None)
+        if penalty == "l1":
+            p["solver"] = "liblinear"
+        elif penalty == "elasticnet":
+            p["solver"] = "saga"
+        else:  # l2 or None
+            p["solver"] = "lbfgs"
+
         return LogisticRegression(**p, random_state=random_state)
 
     if model_name == "Random Forest":
