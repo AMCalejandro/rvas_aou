@@ -107,8 +107,12 @@ if args.predictors_file:
 for model in model_types:
     j = b.new_job(name=f'Train-{model.replace(" ", "-")}')
     
-    j._machine_type = config['model-training']['machine-type']
-    j.storage('10Gi')  # Sufficient for pixi, model, and outputs
+    if not args.tune:
+        j._machine_type = config['model-training']['machine-type']
+        j.storage('10Gi')  # Sufficient for pixi, model, and outputs
+    else:
+        j._machine_type = config['model-tuning']['machine-type']
+        
     
     j.command('git clone -b scallion-interpretation https://github.com/AMCalejandro/rvas_aou.git')
     j.command('cd rvas_aou')
@@ -141,7 +145,7 @@ for model in model_types:
     
     else:
         tune_cmd = (
-            f'pixi run python -m model_training.tune_model '
+            f'pixi run python -m model_training.tune_hyperparam.tune_model '
             f'{quote(model)} '
             f'{quote(training_data)} '
             f'./output/ '
