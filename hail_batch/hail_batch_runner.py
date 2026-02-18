@@ -67,6 +67,11 @@ parser.add_argument(
     default=42,
     help='Random state for reproducibility (default: 42)'
 )
+parser.add_argument(
+    '--tune',
+    action='store_true',
+    help='If set, run hyperparameter tuning with Optuna instead of standard training'
+)
 
 args = parser.parse_args()
 
@@ -115,29 +120,54 @@ for model in model_types:
     j.command('pixi install')
     
     # Build the training command
-    training_cmd = (
-        f'pixi run python -m model_training.run_model '
-        f'{quote(model)} '
-        f'{quote(training_data)} '
-        f'./output/ '
-        f'--target-column {quote(args.target_column)} '
-    )
-    
-    if predictors_file:
-        training_cmd += f'--predictors-file {quote(predictors_file)} '
-    
-    training_cmd += (
-        f'--framework {quote(args.framework)} '
-        f'--n-folds {args.n_folds} '
-        f'--random-state {args.random_state} '
-    )
+    if not args.tune:
+        training_cmd = (
+            f'pixi run python -m model_training.run_model '
+            f'{quote(model)} '
+            f'{quote(training_data)} '
+            f'./output/ '
+            f'--target-column {quote(args.target_column)} '
+        )
+        if predictors_file:
+            training_cmd += f'--predictors-file {quote(predictors_file)} '
+        
+        training_cmd += (
+            f'--framework {quote(args.framework)} '
+            f'--n-folds {args.n_folds} '
+            f'--random-state {args.random_state} '
+        )
 
-    if args.bin_threshold is not None:
-        training_cmd += f'--bin-threshold {args.bin_threshold} '
-    if args.top_percent is not None:
-        training_cmd += f'--top-percent {args.top_percent} '
+        if args.bin_threshold is not None:
+            training_cmd += f'--bin-threshold {args.bin_threshold} '
+        if args.top_percent is not None:
+            training_cmd += f'--top-percent {args.top_percent} '
+        
+        j.command(training_cmd)
     
-    j.command(training_cmd)
+    else:
+        tune_cmd = (
+            f'pixi run python -m model_training.tune_model '
+            f'{quote(model)} '
+            f'{quote(training_data)} '
+            f'./output/ '
+            f'--target-column {quote(args.target_column)} '
+        )
+
+        if predictors_file:
+            tune_cmd += f'--predictors-file {quote(predictors_file)} '
+
+        tune_cmd += (
+            f'--framework {quote(args.framework)} '
+            f'--n-folds {args.n_folds} '
+            f'--random-state {args.random_state} '
+        )
+
+        if args.bin_threshold is not None:
+            tune_cmd += f'--bin-threshold {args.bin_threshold} '
+        if args.top_percent is not None:
+            tune_cmd += f'--top-percent {args.top_percent} '
+
+        j.command(tune_cmd)
     
     # Move standard output files to job output files
     j.command(f'mv ./output/results.json {j.ofile1}')
