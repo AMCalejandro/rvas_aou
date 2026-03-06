@@ -302,10 +302,11 @@ class ClassifierBenchmark:
 
                     model_fold.fit(X_train_final, y_train)
 
-                # Calibrate LinearSVC to obtain probabilities
+                # Linear SVM calibration (model_fold already trained inside iterative or marginal path)
                 if model_name == "Linear SVM":
+                    # NOTE: model_fold here is already the raw LinearSVC — do NOT use .estimator
                     calibrator = CalibratedClassifierCV(
-                        estimator=model_fold, method="sigmoid", cv="prefit"
+                        estimator=model_fold,method="sigmoid",cv=3
                     )
                     calibrator.fit(X_train_final, y_train)
                     y_pred_proba = calibrator.predict_proba(X_val_final)[:, 1]
@@ -313,7 +314,7 @@ class ClassifierBenchmark:
                 else:
                     y_pred_proba = model_fold.predict_proba(X_val_final)[:, 1]
                     y_pred = model_fold.predict(X_val_final)
-
+            
             else:
                 features_to_use = list(X.columns)
                 X_train_final = X_train.values
