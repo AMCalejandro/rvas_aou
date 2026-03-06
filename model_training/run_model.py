@@ -475,7 +475,7 @@ class SingleRegressorTrainer(RegressorBenchmark):
                 calibrator = CalibratedClassifierCV(
                     estimator=final_model,
                     method="sigmoid",
-                    cv="prefit"
+                    cv=3
                 )
                 X_for_calib = scaler.transform(X_filtered) if scaler else X_filtered.values
                 calibrator.fit(X_for_calib, y)
