@@ -332,7 +332,7 @@ class SingleModelTrainer(ClassifierBenchmark):
             final_model.fit(X_filtered.values, y)
 
         print("Final classifier training completed.")
-        return final_model, scaler
+        return final_model, scaler, monotonic_features 
 
 
 # ---------------------------------------------------------------------------
@@ -748,14 +748,13 @@ def main():
 
         # ── Final model on all data ───────────────────────────────────────────
         monotonic_features = results['monotonicity_info']['monotonic_features']
-        final_model, scaler = trainer.train_final_model(
+        final_model, scaler, monotonic_features  = trainer.train_final_model(
             X, y, args.model_name, monotonic_features
         )
 
 
         # ── Persist ──────────────────────────────────────────────────────────
-        save_model(final_model, scaler, monotonic_features, args.model_name, args.output_folder)
-        # save_results(results, args.output_folder, args.model_name)
+        save_results(results, args.output_folder, args.model_name)
         save_model(
             final_model, scaler, monotonic_features,
             args.model_name, args.output_folder,
