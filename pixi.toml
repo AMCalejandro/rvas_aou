@@ -17,6 +17,7 @@ scikit-learn = ">=1.0.0"
 xgboost = ">=1.6.0"
 lightgbm = ">=3.3.0"
 optuna = ">=3.0.0"
+joblib = ">=1.1.0"
 
 # Visualization
 matplotlib = ">=3.4.0"
