@@ -20,6 +20,8 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 import pickle
 import time
+import joblib
+
 
 from .models_benchmark import (
     ClassifierBenchmark,
@@ -645,40 +647,75 @@ def save_results(results: Dict, output_folder: str, model_name: str):
     print(f"Metrics CSV saved to: {csv_path}")
 
 
-def save_model(
-    model: object,
-    scaler: Optional[StandardScaler],
-    monotonic_features: List[str],
-    model_name: str,
-    output_folder: str,
-    framework: str = 'binary',
-):
-    """Save trained model, scaler, feature list and metadata."""
+# def save_model(
+#     model: object,
+#     scaler: Optional[StandardScaler],
+#     monotonic_features: List[str],
+#     model_name: str,
+#     output_folder: str,
+#     framework: str = 'binary',
+# ):
+#     """Save trained model, scaler, feature list and metadata."""
+#     output_path = Path(output_folder)
+#     output_path.mkdir(parents=True, exist_ok=True)
+
+#     # Model pickle
+#     model_path = output_path / 'model.pkl'
+#     with open(model_path, 'wb') as f:
+#         pickle.dump(model, f)
+#     print(f"Model saved to: {model_path}")
+
+#     # Scaler pickle (if any)
+#     if scaler is not None:
+#         scaler_path = output_path / 'scaler.pkl'
+#         with open(scaler_path, 'wb') as f:
+#             pickle.dump(scaler, f)
+#         print(f"Scaler saved to: {scaler_path}")
+
+#     # Metadata JSON
+#     metadata = {
+#         'model_name':        model_name,
+#         'framework':         framework,
+#         'monotonic_features': monotonic_features,
+#         'n_features':        len(monotonic_features),
+#         'uses_scaler':       scaler is not None,
+#     }
+#     metadata_path = output_path / 'model_metadata.json'
+#     with open(metadata_path, 'w') as f:
+#         json.dump(metadata, f, indent=2)
+#     print(f"Model metadata saved to: {metadata_path}")
+
+#     # Plain-text feature list
+#     features_path = output_path / 'features.txt'
+#     with open(features_path, 'w') as f:
+#         f.write("# Monotonic features used in the final model\n")
+#         f.write("# One feature per line\n\n")
+#         for feat in monotonic_features:
+#             f.write(f"{feat}\n")
+#     print(f"Feature list saved to: {features_path}")
+def save_model(final_model, scaler, monotonic_features, model_name, output_folder, framework):
     output_path = Path(output_folder)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Model pickle
-    model_path = output_path / 'model.pkl'
-    with open(model_path, 'wb') as f:
-        pickle.dump(model, f)
-    print(f"Model saved to: {model_path}")
+    clean_name = model_name.replace(" ", "_").replace("(", "").replace(")", "")
 
-    # Scaler pickle (if any)
+    # Use joblib instead of pickle
+    joblib.dump(final_model, output_path / f"{clean_name}.pkl")
+
     if scaler is not None:
-        scaler_path = output_path / 'scaler.pkl'
-        with open(scaler_path, 'wb') as f:
-            pickle.dump(scaler, f)
-        print(f"Scaler saved to: {scaler_path}")
+        joblib.dump(scaler, output_path / f"{clean_name}_scaler.pkl")
 
-    # Metadata JSON
     metadata = {
-        'model_name':        model_name,
-        'framework':         framework,
-        'monotonic_features': monotonic_features,
-        'n_features':        len(monotonic_features),
-        'uses_scaler':       scaler is not None,
+        "model_name": model_name,
+        "framework": framework,
+        "monotonic_features": monotonic_features,
+        "uses_scaler": scaler is not None,
     }
+    with open(output_path / f"{clean_name}_metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+    
     metadata_path = output_path / 'model_metadata.json'
+    
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2)
     print(f"Model metadata saved to: {metadata_path}")
