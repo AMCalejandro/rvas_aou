@@ -518,6 +518,73 @@ class SingleRegressorTrainer(RegressorBenchmark):
 # ---------------------------------------------------------------------------
 # Saving utilities  (framework-aware)
 # ---------------------------------------------------------------------------
+import numpy as np
+from sklearn.metrics import precision_recall_curve
+
+
+def _interpolate_mean_pr_curve(
+    pr_curve_folds: List[Dict],
+    n_points: int = 200,
+) -> Dict:
+    """
+    Interpolate each fold's PR curve onto a shared recall grid and
+    compute the mean ± std precision across folds.
+
+    Recall is naturally decreasing from precision_recall_curve, so we
+    flip, interpolate on an ascending grid, then report the result in
+    descending recall order (conventional PR-curve orientation).
+    """
+    recall_grid = np.linspace(0, 1, n_points)
+    interp_precisions = []
+
+    for fold_data in pr_curve_folds:
+        rec  = np.array(fold_data['recall'])
+        prec = np.array(fold_data['precision'])
+        # precision_recall_curve returns descending recall → flip to ascending
+        rec_asc  = rec[::-1]
+        prec_asc = prec[::-1]
+        # np.interp needs strictly increasing x; deduplicate
+        _, idx = np.unique(rec_asc, return_index=True)
+        interp_p = np.interp(recall_grid, rec_asc[idx], prec_asc[idx])
+        interp_precisions.append(interp_p)
+
+    interp_precisions = np.array(interp_precisions)   # shape (n_folds, n_points)
+
+    return {
+        'recall_grid':     recall_grid.tolist(),
+        'precision_mean':  interp_precisions.mean(axis=0).tolist(),
+        'precision_std':   interp_precisions.std(axis=0).tolist(),
+        'precision_upper': (interp_precisions.mean(axis=0) + interp_precisions.std(axis=0)).tolist(),
+        'precision_lower': np.clip(
+            interp_precisions.mean(axis=0) - interp_precisions.std(axis=0), 0, 1
+        ).tolist(),
+    }
+
+
+def _summarise_scatter_folds(scatter_folds: List[Dict]) -> Dict:
+    """
+    Collect all fold actual/predicted pairs and compute per-point
+    residuals for an actual-vs-predicted plot.
+    """
+    all_true, all_pred, all_fold_ids = [], [], []
+    for fd in scatter_folds:
+        all_true.extend(fd['y_true'])
+        all_pred.extend(fd['y_pred'])
+        all_fold_ids.extend([fd['fold']] * len(fd['y_true']))
+
+    all_true  = np.array(all_true)
+    all_pred  = np.array(all_pred)
+    residuals = all_true - all_pred
+
+    return {
+        'y_true':     all_true.tolist(),
+        'y_pred':     all_pred.tolist(),
+        'residuals':  residuals.tolist(),
+        'fold_ids':   all_fold_ids,
+        # Diagonal reference line boundaries
+        'axis_min':   float(min(all_true.min(), all_pred.min())),
+        'axis_max':   float(max(all_true.max(), all_pred.max())),
+    }
 
 def save_results(results: Dict, output_folder: str, model_name: str):
     """Save results to output folder. Handles both binary and regression."""
@@ -642,6 +709,37 @@ def save_results(results: Dict, output_folder: str, model_name: str):
             'spearman_mean': perf['spearman_mean'],
             'spearman_std':  perf['spearman_std'],
         })
+
+    # ── Curve data for downstream plotting ──────────────────────────────────
+    perf = results['model_performance']   # already defined above in the function
+
+    if framework == 'binary' and 'pr_curve_folds' in perf:
+        # Per-fold raw curves
+        pr_folds_path = output_path / 'pr_curve_folds.json'
+        with open(pr_folds_path, 'w') as f:
+            json.dump(_convert(perf['pr_curve_folds']), f)
+        print(f"PR curve folds saved to: {pr_folds_path}")
+
+        # Mean ± std interpolated curve
+        mean_pr = _interpolate_mean_pr_curve(perf['pr_curve_folds'])
+        mean_pr_path = output_path / 'pr_curve_mean.json'
+        with open(mean_pr_path, 'w') as f:
+            json.dump(_convert(mean_pr), f, indent=2)
+        print(f"Mean PR curve saved to:  {mean_pr_path}")
+
+    if framework == 'regression' and 'scatter_folds' in perf:
+        # Per-fold raw arrays
+        scatter_folds_path = output_path / 'scatter_folds.json'
+        with open(scatter_folds_path, 'w') as f:
+            json.dump(_convert(perf['scatter_folds']), f)
+        print(f"Scatter folds saved to:  {scatter_folds_path}")
+
+        # Aggregated actual-vs-predicted + residuals
+        scatter_summary = _summarise_scatter_folds(perf['scatter_folds'])
+        scatter_path = output_path / 'actual_vs_predicted.json'
+        with open(scatter_path, 'w') as f:
+            json.dump(_convert(scatter_summary), f, indent=2)
+        print(f"Actual vs predicted saved to: {scatter_path}")
 
     pd.DataFrame([row]).to_csv(csv_path, index=False)
     print(f"Metrics CSV saved to: {csv_path}")

@@ -21,7 +21,8 @@ from lightgbm import LGBMClassifier, LGBMRegressor
 from sklearn.metrics import (
     average_precision_score, roc_auc_score, f1_score,
     precision_score, recall_score, confusion_matrix,
-    mean_squared_error, mean_absolute_error, r2_score
+    mean_squared_error, mean_absolute_error, r2_score,
+    precision_recall_curve,   # ← ADD THIS
 )
 from sklearn.calibration import CalibratedClassifierCV
 from scipy.stats import spearmanr
@@ -242,6 +243,7 @@ class ClassifierBenchmark:
             'avg_precision', 'roc_auc', 'f1_score',
             'precision', 'recall', 'tn', 'fp', 'fn', 'tp',
         ]}
+        pr_curve_folds: List[Dict] = []
 
         print(f"\nEvaluating {model_name}")
         selected_features_across_folds = []
@@ -329,6 +331,14 @@ class ClassifierBenchmark:
             precision = precision_score(y_val, y_pred, zero_division=0)
             recall    = recall_score(y_val, y_pred)
             tn, fp, fn, tp = confusion_matrix(y_val, y_pred).ravel()
+            # ── Collect PR curve data for this fold ─────────────────────────────
+            prec_curve, rec_curve, thresh_curve = precision_recall_curve(y_val, y_pred_proba)
+            pr_curve_folds.append({
+                'fold':      fold,
+                'precision': prec_curve.tolist(),
+                'recall':    rec_curve.tolist(),
+                'threshold': thresh_curve.tolist(),   # len = len(prec_curve) - 1
+            })
 
             fold_metrics['avg_precision'].append(avg_prec)
             fold_metrics['roc_auc'].append(roc_auc)
@@ -380,6 +390,7 @@ class ClassifierBenchmark:
             'fp_mean': np.mean(fold_metrics['fp']),
             'fn_mean': np.mean(fold_metrics['fn']),
             'tp_mean': np.mean(fold_metrics['tp']),
+            'pr_curve_folds': pr_curve_folds,
         }
 
     def run_benchmark(self, X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
@@ -525,6 +536,7 @@ class RegressorBenchmark:
         fold_metrics: Dict[str, List] = {
             'rmse': [], 'mae': [], 'r2': [], 'spearman': [],
         }
+        scatter_folds: List[Dict] = [] 
 
         print(f"\nEvaluating {model_name}")
         selected_features_across_folds: List[set] = []
@@ -615,6 +627,12 @@ class RegressorBenchmark:
             r2   = r2_score(y_val, y_pred)
             sp_corr, _ = spearmanr(y_val, y_pred)
 
+            scatter_folds.append({
+                'fold':      fold,
+                'y_true':    y_val.tolist(),
+                'y_pred':    y_pred.tolist(),
+            })
+
             fold_metrics['rmse'].append(rmse)
             fold_metrics['mae'].append(mae)
             fold_metrics['r2'].append(r2)
@@ -658,6 +676,7 @@ class RegressorBenchmark:
             'r2_std':        np.std(fold_metrics['r2']),
             'spearman_mean': np.mean(fold_metrics['spearman']),
             'spearman_std':  np.std(fold_metrics['spearman']),
+            'scatter_folds': scatter_folds,
         }
 
     # ── Pipeline entry-point ─────────────────────────────────────────────────

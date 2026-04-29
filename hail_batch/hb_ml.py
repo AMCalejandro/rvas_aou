@@ -187,6 +187,18 @@ for model in model_types:
         j.command(f'mv ./output/scaler.pkl {j.ofile6}')
         b.write_output(j.ofile6, f'{output_folder}/{args.target_column}/models/{model_name}_scaler.pkl')
 
+    if args.framework == 'binary':
+        j.command(f'mv ./output/pr_curve_folds.json {j.ofile7}')
+        j.command(f'mv ./output/pr_curve_mean.json  {j.ofile8}')
+        b.write_output(j.ofile7, f'{output_folder}/{args.target_column}{model_name}_pr_curve_folds.json')
+        b.write_output(j.ofile8, f'{output_folder}/{args.target_column}{model_name}_pr_curve_mean.json')
+    elif args.framework == 'regression':
+        j.command(f'mv ./output/scatter_folds.json        {j.ofile7}')
+        j.command(f'mv ./output/actual_vs_predicted.json  {j.ofile8}')
+        b.write_output(j.ofile7, f'{output_folder}/{args.target_column}{model_name}_scatter_folds.json')
+        b.write_output(j.ofile8, f'{output_folder}/{args.target_column}{model_name}_actual_vs_predicted.json')
+
+
 print(f"\nSubmitting batch with {len(model_types)} model training jobs...")
 b.run()
 print("Batch submitted successfully!")
