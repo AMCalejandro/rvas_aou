@@ -1,7 +1,5 @@
+import os
 import hail as hl
-import pandas as pd
-
-from utils.scallion import compute_scallion_scores
 
 def filter_gene_matrix(
     gene_mt_path,
@@ -27,11 +25,11 @@ def filter_gene_matrix(
     """
 
     gene_mt = hl.read_matrix_table(gene_mt_path)
-
+    
     if phecodes_keep is None:
         phecodes_keep = gene_mt.aggregate_cols(
             hl.agg.filter(
-                ~gene_mt.phenocode.lower().contains('custom'),
+                ~gene_mt.modifier.lower().contains('custom'),
                 hl.agg.collect_as_set(gene_mt.phenocode)
             )
         )
@@ -41,25 +39,28 @@ def filter_gene_matrix(
         phecodes_keep = list(phecodes_keep - phecodes_exclude)
         print(f"[i] Keeping {len(phecodes_keep)} phecodes after filtering out {len(phecodes_exclude)} custom phecodes not in correlation matrix.")
 
-    mt = gene_mt.filter_cols(hl.literal(phecodes_keep).contains(gene_mt.phenocode))
-    mt = mt.filter_rows(mt.annotation == "pLoF")
-    mt = mt.filter_entries(mt.Pvalue_Burden < pval_threshold)
-
-    mt = mt.filter_entries(hl.is_defined(mt.entry))
-    mt = mt.filter_rows(hl.agg.count_where(hl.is_defined(mt.entry)) > 0)
-    mt = mt.filter_cols(hl.agg.count_where(hl.is_defined(mt.entry)) > 0)
+    gene_mt = gene_mt.filter_cols(hl.literal(phecodes_keep).contains(gene_mt.phenocode))
+    gene_mt = gene_mt.filter_rows(gene_mt.annotation == "pLoF")
+    gene_mt = gene_mt.filter_entries(
+        hl.any(lambda p: p < pval_threshold,
+            [gene_mt.Pvalue_Burden])
+    )
+    gene_mt = gene_mt.filter_rows(hl.agg.count_where(hl.is_defined(gene_mt.entry)) > 0)
+    gene_mt = gene_mt.filter_cols(hl.agg.count_where(hl.is_defined(gene_mt.entry)) > 0)
 
     if checkpoint_path is not None:
-        mt = mt.naive_coalesce(n_partitions)
-        mt = mt.checkpoint(checkpoint_path, overwrite=True)
+        gene_mt = gene_mt.naive_coalesce(n_partitions)
+        gene_mt = gene_mt.checkpoint(checkpoint_path, overwrite=True)
 
-    return mt
+    return gene_mt
 
-
-def get_significant_genes(mt, save_path: str, n_partitions: int = 100):
+def get_significant_genes(mt, 
+                          save_path: str, 
+                          n_partitions: int = 100, 
+                          mode: str = 'multi'):
     """Extract non-sparse entries and return significant genes."""
     ht = mt.entries()
-    ht = ht.key_by("gene_symbol", "phenocode").distinct().key_by()
+    ht = ht.key_by('gene_symbol','phenocode','coding').distinct().key_by()
     ht = ht.naive_coalesce(n_partitions)
     ht = ht.checkpoint(save_path, overwrite=True)
 
@@ -67,7 +68,8 @@ def get_significant_genes(mt, save_path: str, n_partitions: int = 100):
         tot_count=hl.agg.count()
     )
     gene_counts = gene_counts.order_by(hl.desc("tot_count"))
-    gene_counts = gene_counts.filter(gene_counts.tot_count > 1)
+    if mode == 'multi':
+        gene_counts = gene_counts.filter(gene_counts.tot_count > 1)
 
     save_out_genes_txt = '.'.join(save_path.rsplit('.', 1)[:-1]) + '.txt'
     gene_counts.select("gene_symbol").export(save_out_genes_txt, header=False, delimiter=" ")
@@ -75,187 +77,48 @@ def get_significant_genes(mt, save_path: str, n_partitions: int = 100):
     
     return ht, plof_genes
 
+def get_remaining_genes(plof_genes, results_prefix, overwrite=False):
+    """
+    Filter `plof_genes` down to those that don't already have a results CSV
+    in `results_prefix`, unless `overwrite` is True.
 
-def get_gene_phenotype_correlations(ht, phenos_cor_path: str, gene: str):
-    """Get phenotype correlations for a given gene."""
-    phenos_cor = hl.read_table(phenos_cor_path)
+    Parameters
+    ----------
+    plof_genes : list[str]
+        Candidate genes to run.
+    results_prefix : str
+        GCS path prefix where per-gene outputs live, e.g.
+        'gs://aou_amc/scallion/results_final/test/'. Each gene's result is
+        expected at f"{results_prefix}{gene}.csv".
+    overwrite : bool
+        If True, skip the existence check and return the full gene list.
 
-    b_plof = ht.filter(ht.gene_symbol == gene).key_by().select(
-        "phenocode", "coding", "BETA_Burden"
+    Returns
+    -------
+    list[str]
+        Genes still needing to be run.
+    """
+    if overwrite:
+        print(f"Overwrite=True: running all {len(plof_genes)} genes.")
+        return plof_genes
+
+    if not hl.hadoop_exists(results_prefix):
+        print(f"No existing results at {results_prefix}. Running all {len(plof_genes)} genes.")
+        return plof_genes
+
+    existing_files = hl.hadoop_ls(results_prefix)
+    existing_genes = {
+        os.path.basename(f['path'])[:-len('.csv')]
+        for f in existing_files
+        if f['path'].endswith('.csv')
+    }
+
+    remaining_genes = [g for g in plof_genes if g not in existing_genes]
+
+    n_done = len(plof_genes) - len(remaining_genes)
+    print(
+        f"Found {n_done} completed genes out of {len(plof_genes)} in {results_prefix}. "
+        f"{len(remaining_genes)} remaining."
     )
 
-    b_plof_phecodes = b_plof.aggregate(hl.agg.collect_as_set(b_plof.phenocode))
-
-    phenos_cor = phenos_cor.filter(
-        hl.set(b_plof_phecodes).contains(phenos_cor.i_pheno)
-        & hl.set(b_plof_phecodes).contains(phenos_cor.j_pheno)
-    )
-
-    # phenos_cor_phecodes_set = phenos_cor.aggregate(
-    #     hl.agg.collect_as_set(phenos_cor.j_pheno)
-    # )
-    # missing_phecodes = b_plof_phecodes - phenos_cor_phecodes_set
-    # if missing_phecodes:
-    #     print(f'There are missing phenotypes in the correlation matrix for {gene}')
-    #     b_plof = b_plof.filter(~hl.set(missing_phecodes).contains(b_plof.phenocode))
-    
-    pheno_coding_keys = b_plof.aggregate(
-        hl.agg.collect_as_set(
-            hl.struct(phenocode=b_plof.phenocode, coding=b_plof.coding)
-        )
-    )
-
-    blof_pd = b_plof.to_pandas()
-    pheno_corr_pd = phenos_cor.to_pandas()
-    pivot_matrix = pheno_corr_pd.pivot_table(
-        index="i_pheno", columns="j_pheno", values="entry", fill_value=0
-    )
-
-    return pheno_coding_keys, blof_pd, pivot_matrix
-
-
-def filter_variant_matrix(var_path: str, gene: str, pheno_coding_keys, save_path: str):
-    """Filter variant-level matrix for given gene and pheno_coding_keys."""
-    var_mt = hl.read_matrix_table(var_path)
-    
-    var_mt_filtered = hl.filter_intervals(
-        var_mt, 
-        hl.experimental.get_gene_intervals(gene_symbols=[gene], reference_genome='GRCh38') 
-    )
-    
-    var_mt_filtered = var_mt_filtered.filter_cols(
-        hl.literal(pheno_coding_keys).contains(
-            hl.struct(phenocode=var_mt_filtered.phenocode, coding=var_mt_filtered.coding)
-        )
-    )
-    
-    missense_annots = ["missense"]
-    plof_annots = ["pLoF"]
-    var_mt_filtered = var_mt_filtered.filter_rows(
-        (var_mt_filtered.gene == gene)
-        & (hl.literal(missense_annots + plof_annots).contains(var_mt_filtered.annotation))
-    )
-    var_mt_filtered_ht = var_mt_filtered.entries()
-    var_mt_filtered_ht = var_mt_filtered_ht.naive_coalesce(150)
-    var_mt_filtered_ht = var_mt_filtered_ht.checkpoint(save_path, overwrite=True)
-    var_mt_filtered_ht = var_mt_filtered_ht.key_by()
-    
-    var_missense = var_mt_filtered_ht.filter(
-        hl.literal(missense_annots).contains(var_mt_filtered_ht.annotation)
-    )
-    var_missense = var_missense.select("markerID", "phenocode", "coding", "BETA", "SE")
-    var_missense = var_missense.to_pandas()
-
-    var_plof_entries = var_mt_filtered_ht.filter(
-        hl.literal(plof_annots).contains(var_mt_filtered_ht.annotation)
-    )
-    
-    var_plof = var_plof_entries.group_by(
-        var_plof_entries.phenocode, 
-        var_plof_entries.coding
-    ).aggregate(
-        # Inverse variance weights: w_i = 1/SE_i^2
-        # Weighted beta: sum(BETA_i * w_i) / sum(w_i)
-        # Weighted SE: sqrt(1 / sum(w_i))
-        sum_weights = hl.agg.sum(1.0 / (var_plof_entries.SE ** 2)),
-        weighted_beta_sum = hl.agg.sum(var_plof_entries.BETA / (var_plof_entries.SE ** 2)),
-        n_variants = hl.agg.count()
-    )
-    
-    var_plof = var_plof.annotate(
-        BETA_meta = var_plof.weighted_beta_sum / var_plof.sum_weights,
-        SE_meta = hl.sqrt(1.0 / var_plof.sum_weights)
-    )
-
-    var_plof = var_plof.key_by()
-    var_plof = var_plof.select(
-        "phenocode", "coding", "BETA_meta", "SE_meta", "n_variants"
-    )
-    var_plof = var_plof.to_pandas()
-
-    return var_mt_filtered_ht, var_missense, var_plof
-
-
-def process_gene(
-    gene: str,
-    gene_ht_path,
-    phenos_cor_path: str,
-    var_path: str,
-    results_prefix: str,
-):
-    """Run full pipeline for a single gene."""
-
-    temp_dir = 'gs://aou_tmp'
-    hl.init(
-        master='local[4]',
-        tmp_dir=temp_dir,
-        gcs_requester_pays_configuration='aou-neale-gwas',
-        worker_memory="12g",
-        worker_cores=4,
-        default_reference="GRCh38",
-    )
-    
-    pheno_coding_keys, blof_pd, pivot_matrix = get_gene_phenotype_correlations(
-        gene_ht_path=gene_ht_path,
-        phenos_cor_path=phenos_cor_path,
-        gene=gene,
-    )
-    blof_pd = blof_pd.sort_values("phenocode")
-
-    save_path = f"{results_prefix}/tmp/{gene}_variants.mt"
-    _, var_missense_pd, var_plof_pd = filter_variant_matrix(
-        var_path, gene, pheno_coding_keys, save_path
-    )
-
-    var_missense_pd = var_missense_pd.sort_values("phenocode")
-    var_plof_pd = var_plof_pd.sort_values("phenocode")
-
-    assert (
-        blof_pd.shape[0]
-        == len(var_missense_pd.phenocode.unique())
-        == len(var_plof_pd.phenocode.unique())
-        == pivot_matrix.shape[0]
-    ), "Row counts do not match across datasets."
-    
-    assert (
-        list(var_plof_pd.phenocode) == list(var_missense_pd.phenocode.unique()) == list(pivot_matrix.index)
-    ), "Phenocode order mismatch between plof, missense, or pivot_matrix."
-    
-    ac_mean_missense = (
-        var_missense_pd
-        .groupby('markerID', as_index=False)['AC']
-        .mean()
-        .rename(columns={'AC': 'mean_AC'})
-    )
-    missense_beta_pd = (
-        var_missense_pd
-        .pivot(index='markerID', columns='phenocode', values='BETA')
-        .astype(float)
-    )
-    missense_se_pd = (
-        var_missense_pd
-        .pivot(index='markerID', columns='phenocode', values='SE')
-        .astype(float)
-    )
-
-    df_scores = compute_scallion_scores(
-        gene = gene,
-        beta_lof=var_plof_pd['BETA_meta'].values,#blof_pd["BETA_Burden"].values,
-        se_lof=var_plof_pd['SE_meta'].values,
-        P=pivot_matrix,
-        missense_betas=missense_beta_pd,
-        missense_ses=missense_se_pd,
-        mask_missing=True,
-        min_traits=2,
-    )
-
-    df_scores = df_scores.merge(ac_mean_missense, on='markerID', how='left')
-
-    out_path = f"{results_prefix}/{gene}.csv"
-    df_scores_ht = hl.Table.from_pandas(df_scores)
-    try:
-        df_scores_ht.export(out_path)
-    except:
-        out_path = f"{results_prefix}/{gene}_retry.ht"
-        df_scores_ht.export(out_path)
-    print(f"[✔] Saved results for {gene} → {out_path}")
+    return remaining_genes
