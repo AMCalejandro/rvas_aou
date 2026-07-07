@@ -9,6 +9,9 @@ from scipy.special import gammaincc
 from utils.processing import filter_gene_matrix, get_significant_genes, get_remaining_genes
 
 
+
+
+
 # ---------------------------------------------------------------------------
 # linear-algebra helpers
 # ---------------------------------------------------------------------------
@@ -89,6 +92,7 @@ def _robust_maha(diff, w, V, rel_tol=1e-8):
     quad = float(np.sum((proj[keep] ** 2) / w[keep]))
     return quad, int(np.count_nonzero(keep))
 
+
 def _chi2_sf(x, dof):
     """Survival function of chi-square: P(X > x) for X ~ chi2(dof)."""
     if dof <= 0 or not np.isfinite(x):
@@ -103,7 +107,7 @@ def estimate_lof_concordance(p_class, p_floor, p_ceiling):
     """
     Convert a raw ClinVar pathogenicity rate for a variant class into a
     background-corrected "LoF concordance index" in [0, 1].
-    
+
     p_floor and p_ceiling as that noise floor and achievable ceiling and linearly rescaling
     removes most of the shared bias.
         concordance = clip((p_class - p_floor) / (p_ceiling - p_floor), 0, 1)
@@ -190,7 +194,11 @@ def compute_scallion_scores(
                                            # (order = delta_values). None -> uniform.
                                            # Build one from ClinVar class rates via
                                            # class_prior_weights(estimate_lof_concordance(...)).
-    include_lof_uncertainty: bool = True,
+    sigma_mode: str = "delta_scaled",   # "delta_scaled" (default, v1 behavior)
+                                        # or "legacy_combined" (v2 behavior:
+                                        # single Sigma from sqrt(se_miss^2+se_lof^2),
+                                        # same for every mixture component)
+                                        # or "missense_only" (no LoF uncertainty, single Sigma = se_miss @ P @ se_miss)
     abs_ridge: float = 1e-10,
     rel_ridge: float = 1e-6,
     fit_dof=None,                         # dof for fit_pvalue; default k (traits used)
@@ -220,12 +228,12 @@ def compute_scallion_scores(
 
     # --- mixture prior over components -------------------------------------
     if not component_weights:
-        log_w = np.zeros(n_comp)          # uniform -> constant, cancels
+        log_w = np.zeros(n_comp)
     else:
         p_lof = 0.9438
         p_missense = 0.2965
         p_floor = 0.0890   # Synonymous
-
+        
         concordance = estimate_lof_concordance(p_missense, p_floor, p_lof)
         print(f"Missense LoF concordance index (background-corrected): {concordance:.3f}")
         weights = class_prior_weights(concordance)
@@ -317,7 +325,20 @@ def compute_scallion_scores(
         eig_cache = {}
         reg_events = []
         rel_jitters = []
-        if include_lof_uncertainty:
+
+        if sigma_mode == "legacy_combined":
+            # v2-style: one Sigma for all components, built from the
+            # quadrature-combined SE (LoF uncertainty added in full,
+            # not scaled by delta^2)
+            se_total_i = np.sqrt(se_i ** 2 + se_lof_i ** 2)
+            S_total = _scaled_cov(se_total_i, P_i)
+            L, logdet, ev, rj = _chol_logdet(S_total, abs_ridge, rel_ridge)
+            we, Ve = np.linalg.eigh((S_total + S_total.T) / 2.0)
+            chol_cache = {d2: (L, logdet) for d2 in uniq_d2}
+            eig_cache = {d2: (we, Ve) for d2 in uniq_d2}
+            reg_events.append(ev)
+            rel_jitters.append(rj)
+        elif sigma_mode == "delta_scaled": # This is the version that includes lof_uncertainty
             S_lof = _scaled_cov(se_lof_i, P_i)
             for d2 in uniq_d2:
                 Sig = S_miss + d2 * S_lof
@@ -400,9 +421,6 @@ def compute_scallion_scores(
     return pd.DataFrame(out)
 
 
-# ---------------------------------------------------------------------------
-# processing helpers
-# ---------------------------------------------------------------------------
 def get_gene_phenotype_correlations(gene_ht_path, phenos_cor_path: str, gene: str):
     """Get phenotype correlations for a given gene."""
     
@@ -534,10 +552,6 @@ def filter_variant_matrix(var_path: str, gene: str, pheno_coding_keys, save_path
 
     return var_mt_filtered_ht, var_missense, var_plof
 
-
-# ---------------------------------------------------------------------------
-# main entry point
-# ---------------------------------------------------------------------------
 def process_gene(
     gene: str,
     gene_ht_path,
@@ -546,6 +560,10 @@ def process_gene(
     results_prefix: str,
     permute: bool = True,
     permute_seed: int = None,
+    component_weights: bool = False,
+    sigma_mode: str = "legacy_combined",
+    rel_ridge: float = 1e-6,
+    min_traits: int = 1,
 ):
     """Run full pipeline for a single gene.
 
@@ -557,12 +575,24 @@ def process_gene(
         is unaffected by shuffling.
     permute_seed : int, optional
         Seed for the permutation, for reproducibility. If None, uses global RNG state.
+    component_weights : bool
+        If True, use a prior over the 5 mixture components (built from ClinVar
+        concordance) instead of uniform weighting. Passed through to
+        compute_scallion_scores.
+    sigma_mode : str
+        Sigma construction mode; one of "delta_scaled", "legacy_combined",
+        "missense_only". Passed through to compute_scallion_scores.
+    rel_ridge : float
+        Relative ridge regularization term. Passed through to compute_scallion_scores.
+    min_traits : int
+        Minimum number of traits required per gene. Passed through to
+        compute_scallion_scores.
     """
     hl.init(
         master='local[4]',
         tmp_dir='gs://aou_tmp',
         gcs_requester_pays_configuration='aou-neale-gwas',
-        worker_memory="12g",
+        worker_memory="4g",
         worker_cores=4,
         default_reference="GRCh38",
     )
@@ -628,7 +658,10 @@ def process_gene(
         missense_betas=missense_beta_pd,
         missense_ses=missense_se_pd,
         mask_missing=True,
-        min_traits=1,
+        min_traits=min_traits,
+        component_weights=component_weights,
+        sigma_mode=sigma_mode,
+        rel_ridge=rel_ridge,
     )
 
     df_scores = df_scores.merge(ac_mean_missense, on='markerID', how='left')
@@ -656,11 +689,12 @@ def main(args):
         log="/run_scallion.log",
     )
 
-    genebass_gene_path = "gs://ukbb-exome-public/500k/results/results.mt"
-    phenos_cor_path    = "gs://ukbb-exome-public/500k/qc/correlation_table_phenos_500k.ht"
-    var_path           = "gs://ukbb-exome-public/500k/results/variant_results.mt"
-    results_prefix     = "gs://aou_amc/scallion/results_final"
-    save_out_ht        = 'gs://aou_amc/scallion/dev/pLoF_genebass_significant_nosparse.ht'
+    genebass_gene_path      = "gs://ukbb-exome-public/500k/results/results.mt"
+    phenos_cor_path         = "gs://ukbb-exome-public/500k/qc/correlation_table_phenos_500k.ht"
+    var_path                = "gs://ukbb-exome-public/500k/results/variant_results.mt"
+    results_prefix_base     = "gs://aou_amc/scallion/results_final"
+    results_prefix          = f"{results_prefix_base}/{args.analysis_name}".rstrip('/') + '/'
+    save_out_ht             = 'gs://aou_amc/scallion/dev/pLoF_genebass_significant_nosparse.ht'
 
     # --- Load or compute significant genes ---
     if not hl.hadoop_exists(save_out_ht):
@@ -669,6 +703,7 @@ def main(args):
 
     if not args.run_scallion:
         return
+    
     # --- Override gene list from CLI if provided ---
     if args.genes:
         plof_genes = args.genes
@@ -710,11 +745,26 @@ def main(args):
     for gene in plof_genes:
         j = b.new_python_job(f'run_scallion_{gene}', attributes={"gene": gene})
         j.image("hailgenetics/hail:0.2.133-py3.11")
-        j.memory('16Gi')   # container memory must exceed driver memory below
-        j.env('PYSPARK_SUBMIT_ARGS', '--driver-memory 12g --executor-memory 12g pyspark-shell')
-        j.call(process_gene, gene, save_out_ht, phenos_cor_path, var_path, results_prefix)
+        j.memory('6Gi')
+        j.cpu(4)
+        j.env('PYSPARK_SUBMIT_ARGS', '--driver-memory 4g --executor-memory 4g pyspark-shell')
+        j.call(
+            process_gene,
+            gene,
+            save_out_ht,
+            phenos_cor_path,
+            var_path,
+            results_prefix,
+            permute=args.permute,
+            permute_seed=args.permute_seed,
+            component_weights=args.component_weights,
+            sigma_mode=args.sigma_mode,
+            rel_ridge=args.rel_ridge,
+            min_traits=args.min_traits,
+        )
 
     b.run()
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run scallion.')
@@ -723,15 +773,24 @@ if __name__ == '__main__':
                         action='store_true', 
                         help='Run scallion')
     
+    parser.add_argument('--scallion-mode',
+                type=str,
+                choices=['multi', 'single'],
+                help='Use first 3 genes for testing')
+    
     parser.add_argument('--overwrite',
                         help='Overwrite scallion results', 
-                        action='store_true'
-    )
+                        action='store_true')
 
     parser.add_argument('--genes',
                     type=lambda s: [g.strip() for g in s.split(',') if g.strip()],
                     default=None,
                     help='Comma-separated list of genes to run (overrides other gene sources)')
+    
+    parser.add_argument('--analysis-name',
+                    type=str,
+                    default='',
+                    help='Suffix appended to results_prefix, e.g. "run2" or "test_v1"')
     
     parser.add_argument('--test', 
                         action='store_true', 
@@ -741,10 +800,36 @@ if __name__ == '__main__':
                         action='store_true', 
                         help='Use first 3 genes for testing')
     
-    parser.add_argument('--scallion-mode',
+
+    #--- Scallion arguments ---#
+    parser.add_argument('--permute',
+                    action='store_true',
+                    help='Randomly shuffle the LoF beta/SE vectors before scoring (null control)')
+
+    parser.add_argument('--permute-seed',
+                    type=int,
+                    default=999,
+                    help='Seed for the permutation, for reproducibility')
+
+    parser.add_argument('--component-weights',
+                    action='store_true',
+                    help='Use prior over mixture components (built from ClinVar concordance) instead of uniform')
+
+    parser.add_argument('--sigma-mode',
                     type=str,
-                    choices=['multi', 'single'],
-                    help='Use first 3 genes for testing')
+                    choices=['delta_scaled', 'legacy_combined', 'missense_only'],
+                    default='delta_scaled',
+                    help='Sigma construction mode for compute_scallion_scores')
+
+    parser.add_argument('--rel-ridge',
+                    type=float,
+                    default=1e-6,
+                    help='Relative ridge regularization for compute_scallion_scores')
+
+    parser.add_argument('--min-traits',
+                    type=int,
+                    default=1,
+                    help='Minimum number of traits required per gene')
     
     args = parser.parse_args()
     main(args)
