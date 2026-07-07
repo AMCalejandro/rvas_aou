@@ -870,9 +870,14 @@ def main():
         print("  - model.pkl")
         if scaler is not None:
             print("  - scaler.pkl")
-        print("  - model_metadata.json")
-        print("  - features.txt")
-
+            print("  - model_metadata.json")
+            print("  - features.txt")
+        if args.framework == 'binary':
+            print("  - pr_curve_folds.json     ← per-fold PR arrays")
+            print("  - pr_curve_mean.json      ← interpolated mean ± std PR curve")
+        else:
+            print("  - scatter_folds.json      ← per-fold actual/predicted arrays")
+            print("  - actual_vs_predicted.json← aggregated scatter + residuals")
         return 0
 
     except Exception as e:
