@@ -71,7 +71,7 @@ def get_significant_genes(mt,
     if mode == 'multi':
         gene_counts = gene_counts.filter(gene_counts.tot_count > 1)
 
-    save_out_genes_txt = '.'.join(save_path.rsplit('.', 1)[:-1]) + '.txt'
+    save_out_genes_txt = '.'.join(save_path.rsplit('.', 1)[:-1]) + f'_{mode}.txt'
     gene_counts.select("gene_symbol").export(save_out_genes_txt, header=False, delimiter=" ")
     plof_genes = list(gene_counts.aggregate(hl.agg.collect(gene_counts.gene_symbol)))
     
