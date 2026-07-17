@@ -141,12 +141,7 @@ def load_data(
     """
     print(f"Loading data from: {input_path}")
 
-    if input_path.endswith('.tsv'):
-        df = pd.read_csv(input_path, sep='\t')
-    elif input_path.endswith('.csv'):
-        df = pd.read_csv(input_path)
-    else:
-        df = pd.read_csv(input_path, sep=sep)
+    df = pd.read_csv(input_path, sep='\t')
 
     print(f"Loaded {len(df)} rows, {len(df.columns)} columns")
 
