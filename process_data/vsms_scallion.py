@@ -89,6 +89,12 @@ def parse_args():
         action='store_true',
         help="If set, re-run and overwrite outputs even if they already exist."
     )
+    parser.add_argument(
+        '--spearman_vsm_scallion',
+        action='store_true',
+        help="If set (within merge_type='vsm_scallion'), run the VSM-vs-scallion "
+             "statistical comparison and save the summary table and figure."
+    )
     return parser.parse_args()
 
 
@@ -117,25 +123,28 @@ def main(args):
         print(f"scallion_path: {scallion_path}")
         print(f"data_processed_path: {data_processed_path}")
 
-        if not hl.hadoop_exists(ensg_genesymbol_map):
-            path_genebass_vep = 'gs://ukbb-exome-public/500k/results/vep.ht/'
-            ht = hl.read_table(path_genebass_vep)
-            ht = ht.explode(ht.vep.transcript_consequences)
+        need_merge = not hl.hadoop_exists(data_processed_path) or args.overwrite
+        
+        if need_merge:
+            if not hl.hadoop_exists(ensg_genesymbol_map):
+                path_genebass_vep = 'gs://ukbb-exome-public/500k/results/vep.ht/'
+                ht = hl.read_table(path_genebass_vep)
+                ht = ht.explode(ht.vep.transcript_consequences)
 
-            ht_pairs = ht.select(
-                gene_symbol=ht.vep.transcript_consequences.gene_symbol,
-                gene_id=ht.vep.transcript_consequences.gene_id
-            )
-            ht_pairs = ht_pairs.distinct()
-            pairs = ht_pairs.select(ht_pairs.gene_symbol, ht_pairs.gene_id).collect()
+                ht_pairs = ht.select(
+                    gene_symbol=ht.vep.transcript_consequences.gene_symbol,
+                    gene_id=ht.vep.transcript_consequences.gene_id
+                )
+                ht_pairs = ht_pairs.distinct()
+                pairs = ht_pairs.select(ht_pairs.gene_symbol, ht_pairs.gene_id).collect()
 
-            gene_symbol_to_ensg = {row.gene_symbol: row.gene_id for row in pairs}
+                gene_symbol_to_ensg = {row.gene_symbol: row.gene_id for row in pairs}
 
-            with hl.hadoop_open('gs://aou_amc/scallion/utils/genesymbol_to_ensg.pkl', 'wb') as f:
-                pickle.dump(gene_symbol_to_ensg, f)
-        else:
+                with hl.hadoop_open('gs://aou_amc/scallion/utils/genesymbol_to_ensg.pkl', 'wb') as f:
+                    pickle.dump(gene_symbol_to_ensg, f)
+
             if not hl.hadoop_exists(data_processed_tmp_path) or args.overwrite:
-                with hl.hadoop_open('gs://aou_amc/scallion/utils/genesymbol_to_ensg.pkl', 'rb') as f:
+                with hl.hadoop_open(ensg_genesymbol_map, 'rb') as f:
                     gene_symbol_to_ensg = pickle.load(f)
 
                 scallion = pd.read_csv(scallion_path, sep = '\t')
@@ -154,33 +163,40 @@ def main(args):
             else:
                 scallion = pd.read_csv(data_processed_tmp_path, sep = '\t')
 
-        dataset = ds.dataset(
-            vsms_inner,
-            format="parquet",
-        )
+            dataset = ds.dataset(vsms_inner, format="parquet")
 
-        chroms = scallion['chrom'].unique().tolist()
-        positions = scallion['pos'].unique().tolist()
-        refs = scallion['ref'].unique().tolist()
-        alts = scallion['alt'].unique().tolist()
+            chroms = scallion['chrom'].unique().tolist()
+            positions = scallion['pos'].unique().tolist()
+            refs = scallion['ref'].unique().tolist()
+            alts = scallion['alt'].unique().tolist()
 
-        filter_expr = (
-            ds.field('chrom').isin(chroms) &
-            ds.field('pos').isin(positions) &
-            ds.field('ref').isin(refs) &
-            ds.field('alt').isin(alts)
-        )
+            filter_expr = (
+                ds.field('chrom').isin(chroms) &
+                ds.field('pos').isin(positions) &
+                ds.field('ref').isin(refs) &
+                ds.field('alt').isin(alts)
+            )
 
-        filtered_table = dataset.to_table(columns=VSMS_COLS, filter=filter_expr)
-        scores = filtered_table.to_pandas()
+            filtered_table = dataset.to_table(columns=VSMS_COLS, filter=filter_expr)
+            scores = filtered_table.to_pandas()
 
-        merged = scallion.merge(
-            scores,
-            on=['chrom', 'pos', 'ref', 'alt'],
-            how='inner'
-        )
+            merged = scallion.merge(scores, on=['chrom', 'pos', 'ref', 'alt'], how='inner')
+            merged.to_csv(data_processed_path, sep='\t', index=False)
 
-        merged.to_csv(data_processed_path, sep='\t', index=False)
+        elif args.spearman_vsm_scallion:
+            print(f"{data_processed_path} already exists; loading it for the correlation analysis.")
+            merged = pd.read_csv(data_processed_path, sep='\t')
+            from correlation import compare_scores_by_scallion_group
+
+            results_path = f'gs://aou_amc/scallion/results/{scallion_prefix}/vsms_vs_scallion/spearman_vsm_scallion.tsv'
+            figure_path  = f'gs://aou_amc/scallion/results/{scallion_prefix}/vsms_vs_scallion/spearman_vsm_scallion.png'
+
+            compare_scores_by_scallion_group(
+                merged,
+                prob_col='scallion_prob_mixture',
+                results_path=results_path,
+                figure_path=figure_path,
+            )
 
 
 if __name__ == '__main__':
