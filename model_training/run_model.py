@@ -76,7 +76,7 @@ def parse_arguments():
         help='Name of the target column (default: target)'
     )
     parser.add_argument(
-        '--predictors-file', type=str, required=False,
+        '--predictors', type=str, required=False,
         help='Path to a text file containing predictor names (one per line)'
     )
     parser.add_argument(
@@ -120,20 +120,6 @@ def parse_arguments():
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
-
-# def load_predictors_from_file(filepath: str) -> List[str]:
-#     """Load predictor names from a text file (one per line)."""
-#     if not os.path.exists(filepath):
-#         raise FileNotFoundError(f"Predictor file not found: {filepath}")
-#     with open(filepath) as f:
-#         predictors = [
-#             line.strip() for line in f
-#             if line.strip() and not line.startswith('#')
-#         ]
-#     if not predictors:
-#         raise ValueError("Predictor file is empty.")
-#     print(f"Loaded {len(predictors)} predictors from {filepath}")
-#     return predictors
 
 
 def load_data(
