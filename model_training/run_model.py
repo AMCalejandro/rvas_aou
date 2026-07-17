@@ -33,6 +33,13 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.base import clone
 
+
+VSM_PREDICTORS = [
+    'AM', 'mcap', 'esm1b', 'gmvp', 'phylop', 'sift', 'cadd',
+    'cpt', 'gpn_msa', 'ESM_1v', 'EVE', 'popEVE', 'PAI3D',
+    'MisFit_D', 'MisFit_S', 'mpc', 'polyphen'
+]
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -67,10 +74,6 @@ def parse_arguments():
     parser.add_argument(
         '--target-column', type=str, default='target',
         help='Name of the target column (default: target)'
-    )
-    parser.add_argument(
-        '--predictors', type=str, nargs='+', required=False,
-        help='List of predictor column names (space-separated)'
     )
     parser.add_argument(
         '--predictors-file', type=str, required=False,
@@ -118,19 +121,19 @@ def parse_arguments():
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_predictors_from_file(filepath: str) -> List[str]:
-    """Load predictor names from a text file (one per line)."""
-    if not os.path.exists(filepath):
-        raise FileNotFoundError(f"Predictor file not found: {filepath}")
-    with open(filepath) as f:
-        predictors = [
-            line.strip() for line in f
-            if line.strip() and not line.startswith('#')
-        ]
-    if not predictors:
-        raise ValueError("Predictor file is empty.")
-    print(f"Loaded {len(predictors)} predictors from {filepath}")
-    return predictors
+# def load_predictors_from_file(filepath: str) -> List[str]:
+#     """Load predictor names from a text file (one per line)."""
+#     if not os.path.exists(filepath):
+#         raise FileNotFoundError(f"Predictor file not found: {filepath}")
+#     with open(filepath) as f:
+#         predictors = [
+#             line.strip() for line in f
+#             if line.strip() and not line.startswith('#')
+#         ]
+#     if not predictors:
+#         raise ValueError("Predictor file is empty.")
+#     print(f"Loaded {len(predictors)} predictors from {filepath}")
+#     return predictors
 
 
 def load_data(
@@ -818,9 +821,9 @@ def main():
     try:
         # ── Load predictors ──────────────────────────────────────────────────
         predictors = (
-            load_predictors_from_file(args.predictors_file)
-            if args.predictors_file
-            else args.predictors
+            [p.strip() for p in args.predictors.split(',') if p.strip()]
+            if args.predictors
+            else VSM_PREDICTORS
         )
 
         # ── Load data ────────────────────────────────────────────────────────

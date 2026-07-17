@@ -31,10 +31,10 @@ parser.add_argument(
     help='Name of target column in dataset (default: target)'
 )
 parser.add_argument(
-    '--predictors-file',
+    '--predictors',
     type=str,
     default=None,
-    help='Path to file containing predictor column names (optional)'
+    help='Comma-separated list of predictor column names (optional)'
 )
 parser.add_argument(
     '--framework',
@@ -100,9 +100,9 @@ def model_requires_scaler(model_name: str) -> bool:
                         'XGBoost (Deep)', 'LightGBM (Deep)',}
     return model_name not in no_scaler_models
 
-predictors_file = None
-if args.predictors_file:
-    predictors_file = b.read_input(args.predictors_file)
+# predictors_file = None
+# if args.predictors_file:
+#     predictors_file = b.read_input(args.predictors_file)
 
 for model in model_types:
     j = b.new_job(name=f'Train-{model.replace(" ", "-")}')
@@ -114,7 +114,7 @@ for model in model_types:
         j._machine_type = config['model-tuning']['machine-type']
         
     
-    j.command('git clone -b scallion-interpretation https://github.com/AMCalejandro/rvas_aou.git')
+    j.command('git clone https://github.com/AMCalejandro/rvas_aou.git')
     j.command('cd rvas_aou')
     j.command('pixi install')
     
@@ -127,8 +127,8 @@ for model in model_types:
             f'./output/ '
             f'--target-column {quote(args.target_column)} '
         )
-        if predictors_file:
-            training_cmd += f'--predictors-file {quote(predictors_file)} '
+        if args.predictors:
+            training_cmd += f'--predictors {quote(args.predictors)} '
         
         training_cmd += (
             f'--framework {quote(args.framework)} '
@@ -152,8 +152,8 @@ for model in model_types:
             f'--target-column {quote(args.target_column)} '
         )
 
-        if predictors_file:
-            tune_cmd += f'--predictors-file {quote(predictors_file)} '
+        if args.predictors:
+            training_cmd += f'--predictors {quote(args.predictors)} '
 
         tune_cmd += (
             f'--framework {quote(args.framework)} '
