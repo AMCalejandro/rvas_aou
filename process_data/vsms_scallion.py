@@ -6,15 +6,17 @@ import argparse
 
 
 
-SCALLION_COLS = ['chrom', 'pos', 'ref', 'alt', 'mean_AC', 'gene_symbol', 
-                 'scallion_llr', 'scallion_prob_lof_signed', 'scallion_prob_mixture']
-VSMS_COLS = [
-        'chrom', 'pos', 'ref', 'alt', 'ensg',
-        'AM', 'mcap', 'esm1b', 'gmvp', 'phylop', 'sift', 'cadd',
-        'cpt', 'gpn_msa', 'ESM_1v', 'EVE', 'popEVE', 'PAI3D',
-        'MisFit_D', 'MisFit_S', 'mpc', 'polyphen'
-    ]
+SCALLION_COLS = [
+    'chrom', 'pos', 'ref', 'alt', 'mean_AC', 'gene_symbol', 
+    'scallion_llr', 'scallion_prob_lof_signed', 'scallion_prob_mixture'
+]
 
+VSMS_COLS = [
+    'chrom', 'pos', 'ref', 'alt', 'ensg',
+    'AM', 'mcap', 'esm1b', 'gmvp', 'phylop', 'sift', 'cadd',
+    'cpt', 'gpn_msa', 'ESM_1v', 'EVE', 'popEVE', 'PAI3D',
+    'MisFit_D', 'MisFit_S', 'mpc', 'polyphen'
+]
 
 missing_ids = {
     'AC022414.1': 'ENSG00000284762',
@@ -66,112 +68,6 @@ missing_ids = {
     'WDR6': 'ENSG00000178252'
 }
 
-# def merge_scallion_vsm(vsm_type = 'inner'):
-#     if vsm_type == 'inner':
-#         dataset = ds.dataset(
-#             "gs://grohlicek/genetics_gym_vsm_all_content/full_analysis_tables/variant_scores_all_outer_eval.parquet",
-#             format="parquet",
-#         )
-
-
-
-# def parse_args():
-#     parser = argparse.ArgumentParser(description="Build scallion paths from a legacy run ID")
-#     parser.add_argument(
-#         '--scallion_prefix',
-#         type=str,
-#         required=True,
-#         help="Legacy identifier used to locate the scallion results directory (e.g. 'run_2024_v1')"
-#     )
-#     return parser.parse_args()
-
-
-# def main(args):
-#     hl.init(
-#         app_name='Merge data',
-#         idempotent=True,
-#         tmp_dir='gs://aou_tmp',
-#         default_reference="GRCh38",
-#         gcs_requester_pays_configuration="aou-neale-gwas",
-#         log="/run_scallion.log",
-#     )
-    
-#     args = parse_args()
-#     scallion_prefix = args.scallion_prefix
-    
-#     ensg_genesymbol_map     = "gs://aou_amc/scallion/utils/genesymbol_to_ensg.pkl"
-#     scallion_path = f'gs://aou_amc/scallion/results_final/{scallion_prefix}/scallion_concatenated_qc.tsv'
-#     data_processed_tmp_path = f'gs://aou_amc/scallion/training/input_data/scallion_w_vsm_{scallion_prefix}_tmp.tsv.gz'
-#     data_processed_path = f'gs://aou_amc/scallion/training/input_data/scallion_w_vsm_{scallion_prefix}.tsv.gz'
-#     vsms_inner = 'gs://grohlicek/genetics_gym_vsm_all_content/full_analysis_tables/gene_aggregated/variant_scores_all_outer_ensg_stats_eval.parquet'
-    
-#     print(f"scallion_path: {scallion_path}")
-#     print(f"data_processed_path: {data_processed_path}")
-        
-#     if not hl.hadoop_exists(ensg_genesymbol_map):
-#         path_genebass_vep = 'gs://ukbb-exome-public/500k/results/vep.ht/'
-#         ht = hl.read_table(path_genebass_vep)
-#         ht = ht.explode(ht.vep.transcript_consequences)
-
-#         ht_pairs = ht.select(
-#             gene_symbol=ht.vep.transcript_consequences.gene_symbol,
-#             gene_id=ht.vep.transcript_consequences.gene_id
-#         )
-#         ht_pairs = ht_pairs.distinct()
-#         pairs = ht_pairs.select(ht_pairs.gene_symbol, ht_pairs.gene_id).collect()
-
-#         gene_symbol_to_ensg = {row.gene_symbol: row.gene_id for row in pairs}
-        
-#         with hl.hadoop_open('gs://aou_amc/scallion/utils/genesymbol_to_ensg.pkl', 'wb') as f:
-#             pickle.dump(gene_symbol_to_ensg, f)
-#     else:
-#         if not hl.hadoop_exists(data_processed_tmp_path):
-#             with hl.hadoop_open('gs://aou_amc/scallion/utils/genesymbol_to_ensg.pkl', 'rb') as f:
-#                 gene_symbol_to_ensg = pickle.load(f)
-
-#             scallion = pd.read_csv(scallion_path, sep = '\t')
-#             pattern = r'(?P<chrom>chr\w+):(?P<pos>\d+)_(?P<ref>[ACGT]+)/(?P<alt>[ACGT]+)'
-#             scallion[['chrom', 'pos', 'ref', 'alt']] = scallion['markerID'].str.extract(pattern)
-#             scallion['pos'] = scallion['pos'].astype(int)
-#             scallion = scallion[SCALLION_COLS]
-
-#             gene_symbol_idx = scallion.columns.get_loc('gene_symbol')
-#             ensembl_ids = scallion['gene_symbol'].map(gene_symbol_to_ensg)
-#             scallion.insert(gene_symbol_idx + 1, 'ensembl_id', ensembl_ids)
-#             mask = scallion['ensembl_id'].isna()
-#             scallion.loc[mask, 'ensembl_id'] = scallion.loc[mask, 'gene_symbol'].map(missing_ids)
-            
-#             scallion.to_csv(data_processed_tmp_path, sep = '\t', index=False)
-#         else:
-#             scallion = pd.read_csv(data_processed_tmp_path, sep = '\t')
-      
-#     dataset = ds.dataset(
-#         vsms_inner,
-#         format="parquet",
-#     )
-
-#     chroms = scallion['chrom'].unique().tolist()
-#     positions = scallion['pos'].unique().tolist()
-#     refs = scallion['ref'].unique().tolist()
-#     alts = scallion['alt'].unique().tolist()
-    
-#     filter_expr = (
-#         ds.field('chrom').isin(chroms) &
-#         ds.field('pos').isin(positions) &
-#         ds.field('ref').isin(refs) &
-#         ds.field('alt').isin(alts)
-#     )
-    
-#     filtered_table = dataset.to_table(columns=VSMS_COLS, filter=filter_expr)
-#     scores = filtered_table.to_pandas()
-    
-#     merged = scallion.merge(
-#         scores,
-#         on=['chrom', 'pos', 'ref', 'alt'],
-#         how='inner'
-#     )
-
-#     merged.to_csv(data_processed_path, sep='\t', index=False)
 
 
 def parse_args():
@@ -189,6 +85,7 @@ def parse_args():
         help="Type of merge operation to perform. Currently only 'vsm_scallion' is supported."
     )
     return parser.parse_args()
+
 
 
 def main(args):
