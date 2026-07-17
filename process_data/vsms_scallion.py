@@ -84,8 +84,12 @@ def parse_args():
         required=True,
         help="Type of merge operation to perform. Currently only 'vsm_scallion' is supported."
     )
+    parser.add_argument(
+        '--overwrite',
+        action='store_true',
+        help="If set, re-run and overwrite outputs even if they already exist."
+    )
     return parser.parse_args()
-
 
 
 def main(args):
@@ -130,7 +134,7 @@ def main(args):
             with hl.hadoop_open('gs://aou_amc/scallion/utils/genesymbol_to_ensg.pkl', 'wb') as f:
                 pickle.dump(gene_symbol_to_ensg, f)
         else:
-            if not hl.hadoop_exists(data_processed_tmp_path):
+            if not hl.hadoop_exists(data_processed_tmp_path) or args.overwrite:
                 with hl.hadoop_open('gs://aou_amc/scallion/utils/genesymbol_to_ensg.pkl', 'rb') as f:
                     gene_symbol_to_ensg = pickle.load(f)
 
