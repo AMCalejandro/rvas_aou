@@ -7,8 +7,7 @@ import argparse
 
 
 SCALLION_COLS = ['chrom', 'pos', 'ref', 'alt', 'mean_AC', 'gene_symbol', 
-                 'scallion_llr', 'scallion_prob_lof_signed', 'scallion_prob_mixture', 
-                 'mean_AC']
+                 'scallion_llr', 'scallion_prob_lof_signed', 'scallion_prob_mixture']
 VSMS_COLS = [
         'chrom', 'pos', 'ref', 'alt', 'ensg',
         'AM', 'mcap', 'esm1b', 'gmvp', 'phylop', 'sift', 'cadd',
