@@ -1,7 +1,8 @@
+from pathlib import Path
 
 import hail as hl
-import pandas as pd
 import numpy as np
+import pandas as pd
 from scipy import stats
 import matplotlib.pyplot as plt
 
@@ -12,7 +13,80 @@ VSM_SCORE_COLS = [
     'MisFit_D', 'MisFit_S', 'mpc', 'polyphen'
 ]
 
+# Diverging palette (dataviz skill / model_training/reports/generate_figures.py):
+# two hues + a neutral gray midpoint, not a rainbow.
+INK_PRIMARY = "#0b0b0b"
+INK_SECONDARY = "#52514e"
+SURFACE = "#fcfcfb"
+DIVERGING_NEG = "#e34948"
+DIVERGING_MID = "#e1e0d9"
+DIVERGING_POS = "#2a78d6"
 
+
+# ============================================================================
+# Pairwise correlation heatmap
+# ============================================================================
+def plot_correlation_heatmap(corr: pd.DataFrame, output_path: Path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
+
+    n = len(corr)
+    cmap = LinearSegmentedColormap.from_list(
+        "diverging", [DIVERGING_NEG, DIVERGING_MID, DIVERGING_POS]
+    )
+
+    fig, ax = plt.subplots(figsize=(0.65 * n + 3, 0.65 * n + 2.5))
+    im = ax.imshow(corr.values, cmap=cmap, vmin=-1, vmax=1)
+
+    ax.set_xticks(range(n))
+    ax.set_yticks(range(n))
+    ax.set_xticklabels(corr.columns, rotation=45, ha="right", fontsize=8, color=INK_SECONDARY)
+    ax.set_yticklabels(corr.index, fontsize=8, color=INK_SECONDARY)
+
+    for i in range(n):
+        for j in range(n):
+            val = corr.values[i, j]
+            text_color = SURFACE if abs(val) > 0.6 else INK_PRIMARY
+            ax.text(j, i, f"{val:.2f}", ha="center", va="center", fontsize=7, color=text_color)
+
+    ax.set_xticks(np.arange(n + 1) - 0.5, minor=True)
+    ax.set_yticks(np.arange(n + 1) - 0.5, minor=True)
+    ax.grid(which="minor", color=SURFACE, linewidth=2)
+    ax.tick_params(which="minor", bottom=False, left=False)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    cbar = fig.colorbar(im, ax=ax, shrink=0.8)
+    cbar.set_label("Spearman ρ", color=INK_SECONDARY, fontsize=9)
+    cbar.ax.tick_params(colors=INK_SECONDARY, labelsize=8)
+
+    fig.suptitle("Pairwise Spearman correlation between model predictions",
+                 fontsize=13, fontweight="bold", color=INK_PRIMARY, x=0.02, ha="left")
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved correlation heatmap -> {output_path}")
+
+
+def run_correlation(df: pd.DataFrame, pred_columns: list, correlation_output: Path):
+    preds = df[pred_columns].rename(columns=lambda c: c.removeprefix("pred_"))
+    corr = preds.corr(method="spearman")
+
+    correlation_output.parent.mkdir(parents=True, exist_ok=True)
+    csv_path = correlation_output.with_suffix(".csv")
+    corr.to_csv(csv_path)
+    print(f"Saved correlation matrix -> {csv_path}")
+
+    plot_correlation_heatmap(corr, correlation_output)
+
+
+# ============================================================================
+# Score comparison by scallion probability group
+# ============================================================================
 def compare_scores_by_scallion_group(
     df,
     columns_explore=VSM_SCORE_COLS,
