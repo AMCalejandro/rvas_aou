@@ -1,9 +1,8 @@
 import hail as hl
 import argparse
 import numpy as np
-import pandas as pd
 import math
-from typing import List, Optional
+from typing import List
 
 
 # ── FlexRV weight grid constants ──────────────────────────────────────────────
@@ -100,7 +99,6 @@ def _entry_weight_dict(
     return hl.struct(**per_score)
 
 
-
 # ── Cauchy Combination Test helpers ───────────────────────────────────────────
 def add_cct_p_entry(
     gene_mt:      hl.MatrixTable,
@@ -147,24 +145,12 @@ def add_cct_p_entry(
     )
 
 
-# Util for some filtering
-def filter_scallion_data(mt):
-    '''Exclude data used to train scallion'''
-    save_out_ht      = 'gs://aou_amc/scallion/data/pLoF_genebass_significant_nosparse.ht'
-    scallion_training = hl.read_table(save_out_ht)
 
-    exclude_phenos = scallion_training.key_by('phenocode').select()
-    exclude_genes  = scallion_training.key_by('gene_symbol').select()
-
-    mt = mt.filter_cols(hl.is_missing(exclude_phenos[mt.phenocode]))
-    mt = mt.filter_rows(hl.is_missing(exclude_genes[mt.gene]))
-
-    return mt
 
 
 # ── Core single weight burden strategy ──────────────────────────────────────────────
 
-def run_all_models_batched_quant(mt, weight_fields, top_pcts=[0.05, 0.10, 0.15, 0.3, 0.5]):
+def run_all_models_batched_quant(mt, weight_fields, top_pcts=[0.05, 0.10, 0.15, 0.3, 0.5], weighted=True):
     """
     AC-weighted collapsing burden test for quantitative traits, swept across
     weight_fields x top_pcts.
@@ -175,6 +161,17 @@ def run_all_models_batched_quant(mt, weight_fields, top_pcts=[0.05, 0.10, 0.15, 
     i.e. a variant passes when `mt[w] >= threshold`. Matches
     run_all_models_batched_bin — the same top_pcts list means the same thing
     in both functions.
+
+    weighted : bool, default True
+        If True (original behavior), non-baseline scores are continuous in
+        [0, 1] and are used directly as the AC-weighted burden weight w_i
+        for any variant passing threshold. If False, the threshold is still
+        used to select which variants are included, but every passing
+        variant gets a binary weight of 1 instead of its score — i.e. this
+        becomes an unweighted / count-based burden test. `genebass_baseline`
+        is unaffected by this flag either way, since it already always uses
+        a weight of 1. Matches the `weighted` flag in
+        run_all_models_batched_bin.
 
     'genebass_baseline' (score identically 1.0, no thresholding) is handled
     once rather than swept across top_pcts, since sweeping it would just
@@ -215,7 +212,12 @@ def run_all_models_batched_quant(mt, weight_fields, top_pcts=[0.05, 0.10, 0.15, 
     for w in non_baseline:
         for p, thresh in thresholds.items():
             tag = f'{w}__top{p}'
-            w_eff = hl.or_missing(hl.is_defined(mt[w]) & (mt[w] >= thresh), mt[w])
+            passes = hl.is_defined(mt[w]) & (mt[w] >= thresh)
+            if weighted:
+                w_eff = hl.or_missing(passes, mt[w])
+            else:
+                w_eff = hl.or_missing(passes, 1)
+
             agg_dict[f'_sn_{tag}']   = hl.agg.sum(mt.AC * w_eff * mt.BETA)
             agg_dict[f'_sd_{tag}']   = hl.agg.sum(mt.AC * (w_eff ** 2))
             agg_dict[f'n_var_{tag}'] = hl.agg.count_where(hl.is_defined(w_eff))
@@ -263,7 +265,7 @@ def run_all_models_batched_quant(mt, weight_fields, top_pcts=[0.05, 0.10, 0.15, 
 
     return gene_mt.drop(*drop_fields)
 
-def run_all_models_batched_bin(mt, weight_fields, top_pcts=[0.05, 0.10, 0.15, 0.3, 0.5]):
+def run_all_models_batched_bin(mt, weight_fields, top_pcts=[0.05, 0.10, 0.15, 0.3, 0.5], weighted=True):
     """
     IVW burden test for binary/categorical traits, swept across
     weight_fields x top_pcts.
@@ -275,7 +277,18 @@ def run_all_models_batched_bin(mt, weight_fields, top_pcts=[0.05, 0.10, 0.15, 0.
     run_all_models_batched_quant — the same top_pcts list means the same
     thing in both functions.
 
-    Weights are continuous scores in [0, 1], not 0/1 pass/fail indicators.
+    weighted : bool, default True
+        If True (original behavior), non-baseline scores are continuous in
+        [0, 1] and are used directly as the IVW weight w_i for any variant
+        passing threshold. If False, the threshold is still used to select
+        which variants are included, but every passing variant gets a
+        binary weight of 1 instead of its score — i.e. this becomes an
+        unweighted / count-based burden test (equivalent to summing
+        BETA_i / SE_i^2 over passing variants, with the denominator equal
+        to a simple count of 1 / SE_i^2 rather than a score-weighted sum).
+        `genebass_baseline` is unaffected by this flag either way, since it
+        already always uses a weight of 1.
+
     For a variant passing threshold with weight w_i, this test combines
     per-variant score statistics U_i = BETA_i / SE_i^2 (with Var(U_i) =
     1/SE_i^2) as:
@@ -283,7 +296,8 @@ def run_all_models_batched_bin(mt, weight_fields, top_pcts=[0.05, 0.10, 0.15, 0.
         Var(U_burden) = sum(w_i^2 * Var(U_i))  = sum(w_i^2 / SE_i^2)
         Z = U_burden / sqrt(Var(U_burden))
     The denominator must be weighted by w_i**2 (not a bare pass/fail count)
-    whenever weights are continuous rather than binary.
+    whenever weights are continuous rather than binary (i.e. whenever
+    weighted=True).
     """
 
     mt = mt.repartition(17000)
@@ -317,7 +331,11 @@ def run_all_models_batched_bin(mt, weight_fields, top_pcts=[0.05, 0.10, 0.15, 0.
     for w in non_baseline:
         for p, thresh in thresholds.items():
             tag = f'{w}__top{p}'
-            w_eff = hl.or_missing(hl.is_defined(mt[w]) & (mt[w] >= thresh), mt[w])
+            passes = hl.is_defined(mt[w]) & (mt[w] >= thresh)
+            if weighted:
+                w_eff = hl.or_missing(passes, mt[w])
+            else:
+                w_eff = hl.or_missing(passes, 1)
 
             agg_dict[f'sum_num_{tag}']  = hl.agg.sum(w_eff * mt.BETA / (mt.SE ** 2))
             agg_dict[f'sum_info_{tag}'] = hl.agg.sum((w_eff ** 2) / (mt.SE ** 2))
@@ -326,7 +344,7 @@ def run_all_models_batched_bin(mt, weight_fields, top_pcts=[0.05, 0.10, 0.15, 0.
     gene_mt = mt.group_rows_by(mt.gene).aggregate(**agg_dict)
 
     gene_mt = gene_mt.checkpoint(
-        'gs://aou_amc/data/scallion/genebass/burden_results/allmodels_burden_bin_tmp.mt',
+        'gs://aou_amc/scallion/benchmark/data/genebass/ukb_weighted_burden/tmp/burden_bin_tmp.mt',
         overwrite=True,
     )
 
@@ -546,35 +564,6 @@ def run_flexrv_burden_quant(
 
 
 # ── Utils minor processing ──────────────────────────────────────────────
-# def genebass_cleanup(mt, models):
-#     cols_to_drop = [
-#         'n_cases_defined',
-#         'n_cases_both_sexes',
-#         'n_cases_females',
-#         'n_cases_males',
-#         'description',
-#         'description_more',
-#         'coding_description'
-#     ]
-#     mt = mt.drop(*cols_to_drop)
-#     row_fields = list(mt.row)
-#     row_to_drop = [
-#         f for f in row_fields
-#         if (
-#             f.endswith('_prob') or
-#             f.endswith('_pred') or
-#             (f.endswith('_pct') and f not in models) or
-#             f in {
-#                 'proteinmpnn_llr_neg', 'esm1b_neg', 'score_PAI3D', 'revel',
-#                 'rasp_score', 'AM', 'MisFit_D', 'MisFit_S', 'polyphen_score',
-#                 'cpt1_score', 'popEVE_neg', 'EVE', 'ESM_1v_neg', 'mpc',
-#                 'cadd_score', 'gpn_msa_score_neg'
-#             }
-#         )
-#     ]
-#     mt = mt.drop(*row_to_drop)
-#     return mt
-
 def genebass_cleanup(ht, models):
     cols_to_drop = [
         'A1','A2', 'gene'
@@ -598,7 +587,7 @@ def genebass_cleanup(ht, models):
     ht = ht.drop(*row_to_drop)
     return ht
 
-
+# Util for some filtering
 def filter_scallion_data(mt):
     '''Exclude data used to train scallion'''
     save_out_ht      = 'gs://aou_amc/scallion/data/pLoF_genebass_significant_nosparse.ht'
@@ -634,21 +623,16 @@ def parse_args():
                         help='Run on test phenotype C50 only')
     parser.add_argument('--run_tmp', action='store_true',
                         help='Run temp code filter significant')
+    parser.add_argument('--overwrite_pct_ht', action='store_true',
+                        help=(
+                            'Force reimport of the Scallion pct TSV and overwrite the '
+                            'checkpointed HT, even if it already exists.'
+                        ))
     return parser.parse_args()
 
 
 
 def main(args):
-    # hl.init(
-    #     backend='batch',
-    #     idempotent=True,
-    #     tmp_dir='gs://aou_tmp/v8',
-    #     log = "access_flexrv.log",
-    #     app_name="Flexrv_in_genebass_phenos",
-    #     worker_memory='10Gi',
-    #     driver_memory='highmem',
-    #     gcs_requester_pays_configuration="aou-neale-gwas"
-    # )
     hl.init_batch(
         billing_project="all-by-aou",
         remote_tmpdir='gs://aou_tmp/v8',   # note: remote_tmpdir, not tmp_dir, for the batch backend
@@ -656,8 +640,6 @@ def main(args):
         driver_memory='highmem',
         gcs_requester_pays_configuration="aou-neale-gwas",
     )
-
-    # hl.current_backend().requester_pays_config = ('aou-neale-gwas', ['ukbb-exome-public'] )
     
     if args.run_tmp:
         run_temporary()
@@ -665,16 +647,21 @@ def main(args):
     if args.run_burden:
         var_path    = 'gs://ukbb-exome-public/500k/results/variant_results.mt'
         mt_genebass = hl.read_matrix_table(var_path)
-        # ht_scallion = hl.read_table('gs://aou_amc/data/scallion/genebass/predictions/preds_by_chrom/all_chr_pct_preds.ht')
-        ht_scallion = hl.import_table(
-            'gs://aou_amc/scallion/benchmark/data/genebass_w_vsm_w_predictions_w_pct.tsv',
-            impute=True,
-        )
-        ht_scallion = ht_scallion.annotate(
-            locus=hl.parse_locus(ht_scallion.locus, reference_genome='GRCh38'),
-            alleles=ht_scallion.alleles.replace(r'[\[\]"]', '').split(','),
-        )
-        ht_scallion = ht_scallion.key_by('locus', 'alleles')
+        
+        ht_scallion_path = 'gs://aou_amc/scallion/benchmark/data/genebass_w_vsm_w_predictions_w_pct.ht'
+        if hl.hadoop_exists(ht_scallion_path) and not args.overwrite_pct_ht:
+            ht_scallion = hl.read_table(ht_scallion_path)
+        else:
+            ht_scallion = hl.import_table(
+                'gs://aou_amc/scallion/benchmark/data/genebass_w_vsm_w_predictions_w_pct.tsv',
+                impute=True,
+            )
+            ht_scallion = ht_scallion.annotate(
+                locus=hl.parse_locus(ht_scallion.locus, reference_genome='GRCh38'),
+                alleles=ht_scallion.alleles.replace(r'[\[\]"]', '').split(','),
+            )
+            ht_scallion = ht_scallion.key_by('locus', 'alleles')
+            ht_scallion = ht_scallion.checkpoint(ht_scallion_path, overwrite=True)
 
 
         if args.use_flexrv:
@@ -771,7 +758,7 @@ def main(args):
         
         else:
             print("[standard] Starting standard burden pipeline...")
-            BASE_PATH = 'gs://aou_amc/data/scallion/genebass'
+            BASE_PATH = 'gs://aou_amc/scallion/benchmark/data/genebass/ukb_weighted_burden'
             
             # mt_genebass = filter_scallion_data(mt_genebass)
             mt_genebass = mt_genebass.filter_rows(hl.is_defined(ht_scallion[mt_genebass.locus, mt_genebass.alleles]))
@@ -785,7 +772,6 @@ def main(args):
             print(calibrated_scores)
             print(f"[standard] Scallion data filtered and annotated ({len(calibrated_scores)} score fields).")
 
-
             if args.test:
                 test_pheno = 'C43'
                 print(f"[standard] Test mode: filtering to phenotype {test_pheno}...")
@@ -793,88 +779,39 @@ def main(args):
                 if mt_genebass.count_cols() == 0:
                     raise ValueError(f"Test phenotype {test_pheno} not found after filtering — check filter_scallion_data.")
                 mt_genebass = mt_genebass.repartition(100).checkpoint(
-                    f'{BASE_PATH}/burden_results/tmp/standard_{test_pheno.lower()}_test.mt', overwrite=True
+                    f'{BASE_PATH}/tmp/standard_{test_pheno.lower()}_test.mt', overwrite=True
                 )
                 print(f"[standard] Test checkpoint written for {test_pheno}.")
             
             
-            # print("[standard] Filtering entries (BETA/SE/AC validity)...")
             # --- Select run function and output path by trait type ---
-            # if args.trait_type not in trait_config:
-            #     raise ValueError(f"Invalid trait type: {args.trait_type}")
+            trait_config = {
+                'bin': (
+                    mt_genebass.filter_cols(hl.literal(["icd10", "categorical"]).contains(mt_genebass.trait_type) & (mt_genebass.modifier != "custom")),
+                    run_all_models_batched_bin,
+                    f'{BASE_PATH}/bin_multithreshold_unweighted.mt',
+                ),
+                'qt': (
+                    mt_genebass.filter_cols(mt_genebass.trait_type == 'continuous'),
+                    run_all_models_batched_quant,
+                    f'{BASE_PATH}/qt_multithreshold_unweighted.mt',
+                ),
+            }
 
-            if args.trait_type == 'bin':
-                col_filter = hl.literal(["icd10", "categorical"]).contains(mt_genebass.trait_type) & (mt_genebass.modifier != "custom")
-                run_fn = run_all_models_batched_bin
-                out_path = f'{BASE_PATH}/burden_results_v2/tmp/burden_multibins.mt'
-            elif args.trait_type == 'qt':
-                col_filter = mt_genebass.trait_type == 'continuous'
-                run_fn = run_all_models_batched_quant
-                out_path = f'{BASE_PATH}/burden_results_v2/tmp/allmodels_burden_qt.mt'
-            else:
+            if args.trait_type not in trait_config:
                 raise ValueError(f"Invalid trait type: {args.trait_type}")
 
-            mt_filtered = mt_genebass.filter_cols(col_filter)
-
-            mt_filtered = mt_filtered.filter_entries(
-                hl.is_defined(mt_filtered.BETA) &
-                hl.is_defined(mt_filtered.SE) & (mt_filtered.SE > 0) &
-                hl.is_defined(mt_filtered.AC) &
-                (mt_filtered.AC >= 1) & (mt_filtered.AC <= 100)
-            )
-            mt_filtered = mt_filtered.filter_rows(hl.agg.any(hl.is_defined(mt_filtered.BETA)))
-
-
+            mt_filtered, run_fn, out_path = trait_config[args.trait_type]
             print(f"[standard] Running '{args.trait_type}' burden model...")
-            # top_pcts = fraction of top-scoring variants retained per weight field
-            # (e.g. 0.10 -> keep the top 10%). Same convention/list works for both
-            # run_all_models_batched_bin and run_all_models_batched_quant.
-            top_pcts = [0.10, 0.50, 0.75, 0.85]
-            gene_mt = run_fn(mt_filtered, calibrated_scores, top_pcts=top_pcts)
+            top_pcts = [0.10, 0.25, 0.50, 0.75, 0.85]
+            gene_mt = run_fn(mt_filtered, calibrated_scores, top_pcts=top_pcts, weighted = False)
             gene_mt = gene_mt.checkpoint(out_path, overwrite=True)
             print(f"[standard] Done — checkpoint written to {out_path}.")
-
-            # mt_genebass = mt_genebass.filter_entries(
-            #     hl.is_defined(mt_genebass.BETA) &
-            #     hl.is_defined(mt_genebass.SE) & (mt_genebass.SE > 0) &
-            #     hl.is_defined(mt_genebass.AC) &
-            #     (mt_genebass.AC >= 1) & (mt_genebass.AC <= 100)
-            # )
-            # mt_genebass = mt_genebass.filter_rows(hl.agg.any(hl.is_defined(mt_genebass.BETA)))
-
-            # # --- Select run function and output path by trait type ---
-            # trait_config = {
-            #     'bin': (
-            #         mt_genebass.filter_cols(hl.literal(["icd10", "categorical"]).contains(mt_genebass.trait_type) & (mt_genebass.modifier != "custom")),
-            #         run_all_models_batched_bin,
-            #         # f'{BASE_PATH}/burden_results_v2/tmp/allmodels_burden_bin_weightFix_macFilter_top15bin.mt',
-            #         f'{BASE_PATH}/burden_results_v2/tmp/allmodels_burden_bin_NOWEIGHT_macFilter_multiBins.mt',
-            #     ),
-            #     'qt': (
-            #         mt_genebass.filter_cols(mt_genebass.trait_type == 'continuous'),
-            #         run_all_models_batched_quant,
-            #         f'{BASE_PATH}/burden_results_v2/tmp/allmodels_burden_qt.mt',
-            #     ),
-            # }
-
-            # if args.trait_type not in trait_config:
-            #     raise ValueError(f"Invalid trait type: {args.trait_type}")
-
-            # mt_filtered, run_fn, out_path = trait_config[args.trait_type]
-            # print(f"[standard] Running '{args.trait_type}' burden model...")
-            # # top_pcts = fraction of top-scoring variants retained per weight field
-            # # (e.g. 0.10 -> keep the top 10%). Same convention/list works for both
-            # # run_all_models_batched_bin and run_all_models_batched_quant.
-            # top_pcts = [0.10, 0.25, 0.50, 0.75, 0.85]
-            # gene_mt = run_fn(mt_filtered, calibrated_scores, top_pcts=top_pcts)
-            # gene_mt = gene_mt.checkpoint(out_path, overwrite=True)
-            # print(f"[standard] Done — checkpoint written to {out_path}.")
 
     if args.summarize:
         # ── CONFIG ───────────────────────────────────────────────────────────────
         GENEBASS_PATH    = "gs://ukbb-exome-public/500k/results/results.mt"
-        # BASE_PATH        = f"gs://aou_amc/data/scallion/genebass/burden_results_v2/allmodels_burden_{args.trait_type}_v2"
-        BASE_PATH        = f"gs://aou_amc/data/scallion/genebass/burden_results_v2/tmp/allmodels_burden_{args.trait_type}_NOWEIGHT_macFilter_multiBins"
+        BASE_PATH = f"gs://aou_amc/scallion/benchmark/data/genebass/ukb_weighted_burden/{args.trait_type}_multithreshold_unweighted"
         WEIGHTED_RESULTS_PATH = f"{BASE_PATH}.mt"
         OUT_TSV          = f"{BASE_PATH}.tsv"
         OUT_HT           = f"{BASE_PATH}.ht"
@@ -884,9 +821,6 @@ def main(args):
         DROP_COLS = ['interval', 'markerIDs', 'description', 
                      'description_more', 'coding_description', 'category']
         
-        # WEIGHTED_RESULTS_PATH = "gs://aou_amc/data/scallion/genebass/burden_results/allmodels_burden_qt_top15.mt"
-        # OUT_TSV          = f"gs://aou_amc/data/scallion/genebass/burden_results_v2/allmodels_burden_bin.tsv"
-        # OUT_HT           = f"gs://aou_amc/data/scallion/genebass/burden_results_v2/allmodels_burden_bin.ht"
 
         # ── 1. BUILD & CHECKPOINT gb_ht ──────────────────────────────────────────
         # Filter INSIDE the MT (before entries()) so only significant rows/entries
@@ -946,7 +880,7 @@ def main(args):
         joined_ht = gb_ht.join(sc_ht, how='outer')
 
         # ── 4. WRITE OUTPUT ───────────────────────────────────────────────────────
-        joined_ht = joined_ht.naive_coalesce(100).checkpoint(OUT_HT, overwrite=True)
+        joined_ht = joined_ht.naive_coalesce(200).checkpoint(OUT_HT, overwrite=True)
         joined_ht.export(OUT_TSV)
         print(f"Significant rows written → {OUT_HT}")
         print(f"TSV exported             → {OUT_TSV}")
