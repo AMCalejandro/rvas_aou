@@ -1,33 +1,13 @@
 """
-Score a dataset with every finalized model under a models directory and
-write a single TSV with one prediction column per model, added alongside
-the original columns. Optionally also compute the pairwise Spearman
-correlation between model predictions and plot it as a heatmap.
-
-Run from the repo root:
-    pixi run python -m model_predictions.predict_with_models \\
-        --data-path model_predictions/data/scallion_benchmark_data_clinvar_w_vsm.tsv.gz \\
-        --output-path model_predictions/predictions/scallion_benchmark_predictions.tsv.gz \\
-        --models-dir model_training/models \\
-        --correlation
-
---data-path/--output-path also accept gs:// URIs, e.g.:
-    pixi run python -m model_predictions.predict_with_models \\
-        --data-path gs://aou_amc/scallion/benchmark/data/genebass_w_vsm.tsv.gz \\
-        --output-path gs://aou_amc/scallion/benchmark/data/genebass_w_vsm_w_predictions.tsv.gz
-
-Run only the correlations too
+# Full run overwriting results
 pixi run python -m model_predictions.predict_with_models \
     --data-path gs://aou_amc/scallion/benchmark/data/genebass_w_vsm.tsv.gz \
     --output-path gs://aou_amc/scallion/benchmark/data/genebass_w_vsm_w_predictions.tsv.gz \
-    --correlation \
-    --correlation-output /Users/am3171/WorkDir/projects/aou_rvas/rvas_aou/model_predictions/reports/genebass/
-
-Run to compute the percentile transformations
-pixi run python -m model_predictions.predict_with_models \
-    --data-path gs://aou_amc/scallion/benchmark/data/genebass_w_vsm.tsv.gz \
-    --output-path gs://aou_amc/scallion/benchmark/data/genebass_w_vsm_w_predictions.tsv.gz \
-    --pct-output-path gs://aou_amc/scallion/benchmark/data/genebass_w_vsm_w_predictions_w_pct.tsv.gz
+    --pct-output-path gs://aou_amc/scallion/benchmark/data/genebass_w_vsm_w_predictions_w_pct.tsv.gz \
+    --overwrite \
+    --overwrite-pct \
+    --models-dir /Users/am3171/WorkDir/projects/aou_rvas/rvas_aou/model_training/models \
+    --correlation
 """
 
 import argparse
@@ -37,7 +17,7 @@ from pathlib import Path
 import joblib
 import pandas as pd
 
-from model_training.transforms import TARGET_TRANSFORMS
+from model_training.utils.transforms import TARGET_TRANSFORMS
 from utils.io import ensure_parent_dir, path_exists
 from utils.percentiles import run_percentiles
 from utils.correlation import run_correlation
@@ -45,7 +25,7 @@ from utils.correlation import run_correlation
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_PATH = REPO_ROOT / "model_predictions/data/scallion_benchmark_data_clinvar_w_vsm.tsv.gz"
 OUTPUT_PATH = REPO_ROOT / "model_predictions/predictions/scallion_benchmark_predictions_v2.tsv.gz"
-PCT_OUTPUT_PATH = "gs://aou_amc/scallion/benchmark/data/genebass_w_vsm_w_predictions_w_pct.tsv.gz"
+PCT_OUTPUT_PATH = "gs://aou_amc/scallion/benchmark/data/genebass_w_vsm_w_predictions_w_pct.tsv"
 
 MODEL_DIRS = [
     "model_training/models/scallion_prob_mixture_legacy_multi_keep_all_lightgbm_regressor",
@@ -73,14 +53,24 @@ def discover_model_dirs(models_dir: Path) -> list:
 
 def predict_with_model(model_dir: Path, df: pd.DataFrame) -> pd.Series:
     metadata = json.load(open(model_dir / "model_metadata.json"))
-    predictors = metadata["monotonic_features"]
+    monotonic_features = metadata["monotonic_features"]
+    # Pre-selection predictor set the imputer was actually fit on — for
+    # linear models `monotonic_features` can be a dropped-down subset of
+    # this (see finalize.py), so imputing must happen on the full set
+    # first and only then narrow to `monotonic_features` for the scaler/model.
+    full_predictors = metadata.get("predictors", monotonic_features)
     model = joblib.load(model_dir / "model.pkl")
 
-    X = df[predictors]
     imputer_path = model_dir / "imputer.pkl"
     scaler_path = model_dir / "scaler.pkl"
     if imputer_path.exists():
-        X = joblib.load(imputer_path).transform(X)
+        X = df[full_predictors]
+        X = pd.DataFrame(
+            joblib.load(imputer_path).transform(X), columns=full_predictors, index=df.index,
+        )
+        X = X[monotonic_features]
+    else:
+        X = df[monotonic_features]
     if scaler_path.exists():
         X = joblib.load(scaler_path).transform(X)
 
@@ -128,7 +118,7 @@ def build_argparser() -> argparse.ArgumentParser:
                              "If not set and --output-path already exists, predictions are skipped and "
                              "the existing output is reused for the correlation heatmap.")
     parser.add_argument("--pct-output-path", type=str, default=PCT_OUTPUT_PATH,
-                        help="Where to write the gene-level percentile scores (tsv.gz). "
+                        help="Where to write the gene-level percentile scores (tsv). "
                              "Accepts a local path or a gs:// URI.")
     parser.add_argument("--overwrite-pct", action="store_true",
                         help="Re-run gene-level percentile computation and overwrite --pct-output-path "
