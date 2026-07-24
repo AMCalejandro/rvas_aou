@@ -4,3 +4,4 @@ tmp/
 data/
 archive/
 pixi.lock
+.DS_Store
