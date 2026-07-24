@@ -1,6 +1,5 @@
 from pathlib import Path
 
-import hail as hl
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -101,6 +100,9 @@ def compare_scores_by_scallion_group(
     low-probability scallion groups; save a summary table and a
     publication-ready comparison figure.
     """
+    import hail as hl  
+                        
+
     high_prob = df[df[prob_col] > prob_threshold]
     low_prob = df[df[prob_col] <= prob_threshold]
 
