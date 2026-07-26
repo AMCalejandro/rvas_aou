@@ -1,8 +1,10 @@
 import hail as hl
 import argparse
-import numpy as np
+import re
 import math
 from typing import List
+
+import pandas as pd
 
 
 # ── FlexRV weight grid constants ──────────────────────────────────────────────
@@ -84,8 +86,7 @@ def _entry_weight_dict(
     e.g. struct { score_a: [w0, w1, ..., w191], score_b: [...] }
     """
     is_lof   = hl.coalesce(mt.annotation == 'pLoF', False)
-    field1, field2 = maf_field.split('.')
-    maf_expr = hl.coalesce(hl.float64(mt[field1][field2]), 0.0)
+    maf_expr = hl.coalesce(hl.float64(mt[maf_field]), 0.0)
 
     per_score = {}
     for sf in score_fields:
@@ -177,7 +178,7 @@ def run_all_models_batched_quant(mt, weight_fields, top_pcts=[0.05, 0.10, 0.15, 
     once rather than swept across top_pcts, since sweeping it would just
     recompute the same "keep everything" aggregation N times.
     """
-    mt = mt.repartition(14000)
+    # mt = mt.repartition(14000)
 
     thresholds = {p: 1.0 - p for p in top_pcts}
     non_baseline = [w for w in weight_fields if w != "genebass_baseline"]
@@ -300,7 +301,7 @@ def run_all_models_batched_bin(mt, weight_fields, top_pcts=[0.05, 0.10, 0.15, 0.
     weighted=True).
     """
 
-    mt = mt.repartition(17000)
+    # mt = mt.repartition(17000)
 
     thresholds = {p: 1.0 - p for p in top_pcts}
     non_baseline = [w for w in weight_fields if w != "genebass_baseline"]
@@ -425,6 +426,8 @@ def run_flexrv_burden_bin(
     #     hl.is_defined(mt.AC) & (mt.AC >= 3) & (mt.AC <= 20)
     # )
 
+    mt = mt.repartition(14000)
+
     n_samples = hl.int32(mt.n_cases) + hl.int32(mt.n_controls)
     inv_var   = 1.0 / (mt.SE ** 2)
     w_dict    = _entry_weight_dict(mt, score_fields, maf_field, n_samples)
@@ -442,9 +445,7 @@ def run_flexrv_burden_bin(
             )
             for sf in score_fields
         }),
-        n_var = hl.agg.count_where(
-            hl.any([w_dict[sf].any(lambda w: w > 0) for sf in score_fields])
-        ),
+        n_var = hl.agg.count(),
     )
     gene_mt = gene_mt.checkpoint(
         'gs://aou_amc/data/scallion/genebass/burden_results/flexrv_burden_bin_tmp.mt',
@@ -514,16 +515,8 @@ def run_flexrv_burden_quant(
             )
             for sf in score_fields
         }),
-        # _sigma2_y  = hl.agg.mean(ac * (mt.SE ** 2)),  # scalar; weight-independent
-        _sigma2_y = hl.agg.mean(
-            hl.or_missing(
-                hl.any([w_dict[sf].any(lambda w: w > 0) for sf in score_fields]),
-                ac * (mt.SE ** 2)
-            )
-        ),
-        n_var      = hl.agg.count_where(
-            hl.any([w_dict[sf].any(lambda w: w > 0) for sf in score_fields])
-        ),
+        _sigma2_y  = hl.agg.mean(ac * (mt.SE ** 2)),  # scalar; weight- and threshold-independent, over all variants
+        n_var      = hl.agg.count(),
     )
     gene_mt = gene_mt.checkpoint(
         'gs://aou_amc/data/scallion/genebass/burden_results/flexrv_burden_qt_tmp.mt',
@@ -561,32 +554,325 @@ def run_flexrv_burden_quant(
     return gene_mt.drop('_sum_num', '_sum_denom', '_sigma2_y')
 
 
+# ── FlexRV phenotype selection ────────────────────────────────────────────────
+# Picks the phenocodes (bin: + coding) where pLoF burden testing found real
+# signal that the current AM / scallion-baseline scores missed — the panel
+# where a FlexRV rerun has headroom to show a power gain. See
+# select_phenotypes.py for the original, more exploratory version of this.
+UKB_BURDEN_BASE_PATH    = "gs://aou_amc/scallion/benchmark/results/genebass/ukb_weighted_burden"
+FIGURES_BASE_PATH       = f"{UKB_BURDEN_BASE_PATH}/figures"
+FLEXRV_BASE_PATH        = f"{UKB_BURDEN_BASE_PATH}/flexrv/"
+# Phenotype lists are inputs to FlexRV, not results, so they live under the
+# data/ tree rather than alongside FLEXRV_BASE_PATH's burden result outputs.
+FLEXRV_PHENOS_BASE_PATH = "gs://aou_amc/scallion/benchmark/data/genebass/flexrv/"
+FLEXRV_PHENOS_PATH      = {
+    'bin': f'{FLEXRV_PHENOS_BASE_PATH}phenotypes_flexRV/binary_phenos.tsv',
+    'qt':  f'{FLEXRV_PHENOS_BASE_PATH}phenotypes_flexRV/qt_phenos.tsv',
+}
+
+PHENO_SELECT_SIG_THRESHOLD = 2.5e-6
+PHENO_SELECT_N             = 100
+PHENO_SELECT_MODEL_HINTS   = [
+    "p_AM_pct__top0.85",
+    "p_pred_scallion_prob_mixture_new_default_baseline_random_forest_regressor_pct__top0.85",
+]
+CODING_NA_SENTINEL = "__NA_CODING__"
+
+FIG_WIDTH_IN      = 18
+BAR_HEIGHT_IN     = 0.32   # vertical space per bar, so labels don't overlap regardless of bin size
+MIN_ROW_HEIGHT_IN = 2.5
+N_TOP_LABELED     = 3      # how many top-overlap scatter points get their method name written next to them
+
+
+def _short_label(col, suffix):
+    col = col.replace(f"__{suffix}", "")
+    col = col.removeprefix("p_pred_scallion_").removeprefix("p_")
+    col = col.removesuffix("_prob_pct").removesuffix("_pred_pct").removesuffix("_pct")
+    col = col.replace("mixture_", "").replace("new_default_", "")
+    return col.replace("_", " ").strip()
+
+
+def _bar_color(col):
+    # Both scallion families are regressors (e.g. XGBoost), not classifiers —
+    # "p_pred_scallion_llr_..." (log-likelihood-ratio) vs
+    # "p_pred_scallion_prob_..." (probability-mixture) just names which
+    # score the regressor was trained to output, not binary vs. continuous.
+    if "genebass_baseline" in col: return "#E24B4A"
+    if "scallion" in col and "prob" in col: return "#378ADD"
+    if "scallion" in col and "llr"  in col: return "#1D9E75"
+    return "#888780"
+
+
+def _load_missense_and_lof_reference(tsv_path, exclude_custom=True):
+    """
+    Shared prep for phenotype selection and the overlap plot: load a
+    summarize-step TSV, split off the pLoF-significant reference set, and
+    return the score-based (sc_ht-derived) rows deduped by key. The join
+    that produces this TSV duplicates each sc_ht row across every GeneBass
+    annotation (pLoF/missense|LC/synonymous) independently significant for
+    the same (gene, phenocode[, coding]) — filtering on `annotation` would
+    silently drop rows whose only GeneBass match is pLoF, so we dedupe on
+    the key instead. Auto-detects whether 'coding' is part of the (gene,
+    phenocode[, coding]) matching key: qt files leave 'coding' always NA
+    (not part of the key); bin files populate it to distinguish case
+    definitions within a phenocode (part of the key).
+
+    exclude_custom=False keeps custom phenocodes/modifiers in — used for the
+    "_with_customphenos" overlap figure, which reports on all phenotypes.
+
+    Returns (df, triplet_cols, lof_triplet_df, sig_mask).
+    """
+    df = pd.read_csv(tsv_path, sep="\t")
+    if exclude_custom:
+        df = df[df["modifier"] != "custom"]
+        df = df[~df["phenocode"].str.endswith("custom")]
+
+    use_coding = ("coding" in df.columns) and df["coding"].notna().any()
+    if "coding" in df.columns:
+        df["coding"] = df["coding"].fillna(CODING_NA_SENTINEL)
+    triplet_cols = ["gene_symbol", "phenocode", "coding"] if use_coding else ["gene_symbol", "phenocode"]
+
+    def sig_mask(frame, col):
+        return (frame[col] > 0) & (frame[col] < PHENO_SELECT_SIG_THRESHOLD)
+
+    plof_df        = df[df["annotation"] == "pLoF"]
+    lof_triplet_df = plof_df.loc[sig_mask(plof_df, "Pvalue_Burden"), triplet_cols].drop_duplicates()
+
+    # Restrict to the two annotations we care about (or no GeneBass match at
+    # all, i.e. a pure sc_ht-only hit) *before* deduping — otherwise, for a
+    # key duplicated across an unwanted annotation (synonymous, the combined
+    # pLoF|missense|LC) and a wanted one, drop_duplicates could arbitrarily
+    # keep the unwanted row depending on TSV row order.
+    df = df[df["annotation"].isin(["pLoF", "missense|LC"]) | df["annotation"].isna()]
+    p_cols = [c for c in df.columns if c.startswith("p_")]
+    df = df.dropna(subset=p_cols, how="all").drop_duplicates(subset=triplet_cols).copy()
+    return df, triplet_cols, lof_triplet_df, sig_mask
+
+
+def select_phenotypes_for_flexrv(trait_type, burden_mode="multithreshold_weighted"):
+    """
+    Reads the 'summarize' step's TSV for `trait_type`/`burden_mode`, selects
+    up to PHENO_SELECT_N phenocodes with pLoF signal missed by the current
+    baseline scores, and writes:
+      - the (phenocode, coding) pairs, straight to the path run_flexrv_burden_*
+        already reads phenotypes from (FLEXRV_PHENOS_PATH[trait_type])
+      - a per-phenocode recovery-stats CSV, for reference
+    """
+    tsv_path = f"{UKB_BURDEN_BASE_PATH}/{trait_type}_{burden_mode}.tsv"
+    print(f"[select_phenos_flexrv] Loading '{trait_type}' results from {tsv_path}...")
+    df, triplet_cols, lof_triplet_df, sig_mask = _load_missense_and_lof_reference(tsv_path)
+    use_coding     = "coding" in triplet_cols
+    match_key_cols = [c for c in triplet_cols if c != "phenocode"]
+    print(f"[select_phenos_flexrv] triplet_cols: {triplet_cols}  |  "
+          f"pLoF significant tuples: {len(lof_triplet_df)}")
+
+    def resolve_column(hint, columns):
+        if hint in columns:
+            return hint
+        pat = re.compile(rf'(^|_){re.escape(hint)}(_|$)')
+        matches = [c for c in columns if pat.search(c)]
+        if len(matches) == 1:
+            return matches[0]
+        raise ValueError(f"Model hint {hint!r} did not resolve to exactly one column (matches={matches}).")
+
+    model_cols = {hint: resolve_column(hint, df.columns) for hint in PHENO_SELECT_MODEL_HINTS}
+
+    def sig_match_keys_by_phenocode(frame, col):
+        sub = frame.loc[sig_mask(frame, col), ["phenocode"] + match_key_cols].drop_duplicates()
+        if sub.empty:
+            return {}
+        return (
+            sub.groupby("phenocode")[match_key_cols]
+            .apply(lambda g: set(g.itertuples(index=False, name=None)))
+            .to_dict()
+        )
+
+    model_sig_by_pheno = {hint: sig_match_keys_by_phenocode(df, col) for hint, col in model_cols.items()}
+    lof_by_pheno = (
+        lof_triplet_df.groupby("phenocode")[match_key_cols]
+        .apply(lambda g: set(g.itertuples(index=False, name=None)))
+        .to_dict()
+        if not lof_triplet_df.empty else {}
+    )
+
+    records = []
+    for pheno, lof_keys in lof_by_pheno.items():
+        row = {"phenocode": pheno, "n_lof_sig_genes": len(lof_keys)}
+        recovered_union = set()
+        for hint in PHENO_SELECT_MODEL_HINTS:
+            recovered = lof_keys & model_sig_by_pheno[hint].get(pheno, set())
+            row[f"n_recovered__{hint}"] = len(recovered)
+            recovered_union |= recovered
+        row["n_missed"]    = len(lof_keys) - len(recovered_union)
+        row["frac_missed"] = row["n_missed"] / len(lof_keys)
+        records.append(row)
+
+    candidates = pd.DataFrame(records)
+    candidates = candidates[candidates["n_missed"] > 0].sort_values(
+        ["n_missed", "frac_missed"], ascending=[False, False]
+    ).reset_index(drop=True)
+
+    selected_df = candidates.head(PHENO_SELECT_N).copy()
+    selected_phenocodes = selected_df["phenocode"].tolist()
+    print(f"[select_phenos_flexrv] Selected {len(selected_df)}/{PHENO_SELECT_N} phenotypes "
+          f"(of {len(candidates)} candidates with pLoF signal + >=1 missed gene).")
+
+    stats_path = f"{UKB_BURDEN_BASE_PATH}/selected_phenotypes_{trait_type}.csv"
+    selected_df.to_csv(stats_path, index=False)
+    print(f"[select_phenos_flexrv] Saved selection stats -> {stats_path}")
+
+    # ── Hand the selected (phenocode[, coding]) pairs straight to FlexRV ──────
+    pairs = lof_triplet_df.loc[
+        lof_triplet_df["phenocode"].isin(selected_phenocodes),
+        ["phenocode", "coding"] if use_coding else ["phenocode"],
+    ].drop_duplicates()
+    if use_coding:
+        pairs["coding"] = pairs["coding"].replace(CODING_NA_SENTINEL, "NA")
+    else:
+        pairs["coding"] = "NA"
+    flexrv_path = FLEXRV_PHENOS_PATH[trait_type]
+    pairs.to_csv(flexrv_path, sep="\t", index=False)
+    print(f"[select_phenos_flexrv] Saved {len(pairs)} (phenocode, coding) pairs for FlexRV -> {flexrv_path}")
+
+    return selected_df, pairs
+
+
+def plot_missense_lof_overlap(trait_type, tsv_path):
+    """
+    Aggregated missense/pLoF overlap figures across all top-pct bins for
+    `trait_type` (a row per bin: bar chart + discovery-size scatter), saved
+    under FIGURES_BASE_PATH:
+      - triplet-level: (gene_symbol, phenocode[, coding]) hits
+      - gene-level:    gene_symbol hits, collapsed across phenotypes
+      - triplet-level over ALL phenotypes, including the custom ones the
+        two figures above exclude (missense_lof_overlap_triplet_{trait_type}_with_customphenos.png)
+
+    Each row's height scales with its actual bar count (BAR_HEIGHT_IN per
+    bar), so labels stay legible regardless of how many score columns a bin
+    has. The top N_TOP_LABELED points by overlap are labeled directly on
+    each scatter.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    from matplotlib.gridspec import GridSpec
+    import fsspec
+
+    genebass_col = "p_genebass_baseline"
+    legend_patches = [
+        mpatches.Patch(color="#E24B4A", label="Genebass baseline"),
+        mpatches.Patch(color="#378ADD", label="Scallion (prob mixture)"),
+        mpatches.Patch(color="#1D9E75", label="Scallion (LLR)"),
+        mpatches.Patch(color="#888780", label="Pathogenicity scores"),
+    ]
+
+    def render(level, df, triplet_cols, lof_triplet_df, sig_mask, filename_suffix=""):
+        all_p_cols = [c for c in df.columns if c.startswith("p_")]
+        bin_suffixes = sorted(
+            {m.group(1) for c in all_p_cols if (m := re.search(r'__(top[\d.]+)$', c))},
+            key=lambda x: float(x.replace("top", "")),
+        )
+
+        if level == "triplet":
+            ref_set, key_cols, overlap_label = set(lof_triplet_df.itertuples(index=False, name=None)), triplet_cols, "triplets"
+        elif level == "gene":
+            ref_set, key_cols, overlap_label = set(lof_triplet_df["gene_symbol"]), "gene_symbol", "genes"
+        else:
+            raise ValueError(f"Unknown level: {level}")
+
+        def sig_items(frame, col):
+            mask = sig_mask(frame, col)
+            if isinstance(key_cols, str):
+                return set(frame.loc[mask, key_cols])
+            return set(frame.loc[mask, key_cols].drop_duplicates().itertuples(index=False, name=None))
+
+        print(f"[plot_missense_lof_overlap] [{level}{filename_suffix}] pLoF significant reference {overlap_label}: {len(ref_set)}")
+
+        per_suffix_results = {}
+        for suffix in bin_suffixes:
+            p_cols = [c for c in all_p_cols if c.endswith(f"__{suffix}")]
+            if genebass_col in df.columns and genebass_col not in p_cols:
+                p_cols = [genebass_col] + p_cols
+
+            records = []
+            for col in p_cols:
+                items = sig_items(df, col)
+                records.append({
+                    "label":      _short_label(col, suffix),
+                    "n_missense": len(items),
+                    "n_overlap":  len(items & ref_set),
+                    "color":      _bar_color(col),
+                })
+            per_suffix_results[suffix] = pd.DataFrame(records).sort_values(
+                "n_overlap", ascending=False
+            ).reset_index(drop=True)
+
+        # Reserve a fixed number of INCHES (not a fraction) for the suptitle
+        # + legend strip at the top and a small margin at the bottom, so
+        # that margin doesn't balloon into a huge blank gap on a tall,
+        # many-row figure (matplotlib's default top/bottom margins are
+        # fractional, which looks fine on a normal figure but leaves a
+        # multi-inch blank band once the figure is 40+ inches tall).
+        top_margin_in, bottom_margin_in = 1.6, 0.3
+        row_heights = [max(MIN_ROW_HEIGHT_IN, len(per_suffix_results[s]) * BAR_HEIGHT_IN) for s in bin_suffixes]
+        fig_height = sum(row_heights) + top_margin_in + bottom_margin_in
+        fig = plt.figure(figsize=(FIG_WIDTH_IN, fig_height))
+        gs  = GridSpec(len(bin_suffixes), 2, figure=fig, height_ratios=row_heights,
+                        top=1 - top_margin_in / fig_height, bottom=bottom_margin_in / fig_height,
+                        hspace=0.35, wspace=0.25, width_ratios=[2, 1])
+
+        for i, suffix in enumerate(bin_suffixes):
+            results = per_suffix_results[suffix]
+
+            ax_bar = fig.add_subplot(gs[i, 0])
+            ax_bar.barh(range(len(results)), results["n_overlap"], color=results["color"],
+                        height=0.7, edgecolor="white", linewidth=0.6)
+            ax_bar.set_yticks(range(len(results)))
+            ax_bar.set_yticklabels(results["label"], fontsize=10)
+            ax_bar.invert_yaxis()
+            ax_bar.set_title(f"bin: {suffix}  |  LoF reference {overlap_label}: {len(ref_set)}",
+                              fontsize=12, fontweight="bold")
+            ax_bar.spines[["top", "right"]].set_visible(False)
+
+            ax_scatter = fig.add_subplot(gs[i, 1])
+            ax_scatter.scatter(results["n_missense"], results["n_overlap"], c=results["color"],
+                                s=60, edgecolors="white", linewidths=0.6)
+            for _, row in results.nlargest(N_TOP_LABELED, "n_overlap").iterrows():
+                ax_scatter.annotate(
+                    row["label"], xy=(row["n_missense"], row["n_overlap"]),
+                    xytext=(6, 0), textcoords="offset points",
+                    fontsize=8, color="#444441", va="center",
+                )
+            ax_scatter.set_xlabel(f"n significant missense {overlap_label}", fontsize=9)
+            ax_scatter.set_ylabel("n overlapping pLoF", fontsize=9)
+            ax_scatter.spines[["top", "right"]].set_visible(False)
+            ax_scatter.grid(linestyle="--", linewidth=0.4, alpha=0.5)
+
+        fig.legend(handles=legend_patches, loc="upper center", ncol=4, fontsize=11,
+                   bbox_to_anchor=(0.5, 1 - 0.65 / fig_height))
+        fig.suptitle(f"Missense / pLoF {level} overlap — {trait_type}{filename_suffix.replace('_', ' ')} — p < {PHENO_SELECT_SIG_THRESHOLD:.1e}",
+                     fontsize=14, fontweight="bold", y=1 - 0.2 / fig_height)
+
+        fig_path = f"{FIGURES_BASE_PATH}/missense_lof_overlap_{level}_{trait_type}{filename_suffix}.png"
+        with fsspec.open(fig_path, "wb") as f:
+            fig.savefig(f, dpi=180, bbox_inches="tight", format="png")
+        plt.close(fig)
+        print(f"[plot_missense_lof_overlap] Saved {level}{filename_suffix} overlap figure -> {fig_path}")
+
+    print(f"[plot_missense_lof_overlap] Loading '{trait_type}' results from {tsv_path}...")
+    df, triplet_cols, lof_triplet_df, sig_mask = _load_missense_and_lof_reference(tsv_path)
+    render("triplet", df, triplet_cols, lof_triplet_df, sig_mask)
+    render("gene", df, triplet_cols, lof_triplet_df, sig_mask)
+
+    print(f"[plot_missense_lof_overlap] Loading '{trait_type}' results (all phenotypes) from {tsv_path}...")
+    df_all, triplet_cols_all, lof_triplet_df_all, sig_mask_all = _load_missense_and_lof_reference(
+        tsv_path, exclude_custom=False
+    )
+    render("triplet", df_all, triplet_cols_all, lof_triplet_df_all, sig_mask_all, filename_suffix="_with_customphenos")
 
 
 # ── Utils minor processing ──────────────────────────────────────────────
-def genebass_cleanup(ht, models):
-    cols_to_drop = [
-        'A1','A2', 'gene'
-    ]
-    ht = ht.drop(*cols_to_drop)
-    row_fields = list(ht.row)
-    row_to_drop = [
-        f for f in row_fields
-        if (
-            f.endswith('_prob') or
-            f.endswith('_pred') or
-            (f.endswith('_pct') and f not in models) or
-            f in {
-                'proteinmpnn_llr_neg', 'esm1b_neg', 'score_PAI3D', 'revel',
-                'rasp_score', 'AM', 'MisFit_D', 'MisFit_S', 'polyphen_score',
-                'cpt1_score', 'popEVE_neg', 'EVE', 'ESM_1v_neg', 'mpc',
-                'cadd_score', 'gpn_msa_score_neg'
-            }
-        )
-    ]
-    ht = ht.drop(*row_to_drop)
-    return ht
-
 # Util for some filtering
 def filter_scallion_data(mt):
     '''Exclude data used to train scallion'''
@@ -611,11 +897,17 @@ def parse_args():
                         help='Run burden models')
     parser.add_argument('--summarize',  action='store_true',
                         help='Summarize and export significant results')
-    parser.add_argument('--use_flexrv', action='store_true',
+    parser.add_argument('--burden_mode',
+                        choices=['multithreshold_weighted', 'multithreshold_unweighted', 'flexrv'],
+                        default='multithreshold_weighted',
                         help=(
-                            'Use the FlexRV weight-grid approach '
-                            '(192 combined score × MAF weights per score field). '
-                            'If not set, the standard per-weight-field approach is used.'
+                            'Which burden pipeline to run (--run_burden) or summarize '
+                            '(--summarize). multithreshold_weighted/unweighted use the '
+                            'standard per-weight-field sweep (with or without continuous '
+                            'score-based weights); flexrv uses the FlexRV 192-weight-grid '
+                            'approach. Also sets the output/input path suffix under '
+                            'UKB_BURDEN_BASE_PATH, so --run_burden and --summarize stay '
+                            'pointed at the same data.'
                         ))
     parser.add_argument('--trait_type', choices=['qt', 'bin'], required=True,
                         help='Trait type to run: qt (quantitative/continuous) or bin (binary/categorical)')
@@ -628,19 +920,36 @@ def parse_args():
                             'Force reimport of the Scallion pct TSV and overwrite the '
                             'checkpointed HT, even if it already exists.'
                         ))
+    parser.add_argument('--select_phenos_flexrv', action='store_true',
+                        help=(
+                            'Select phenotypes for the FlexRV rerun from the --trait_type '
+                            'summarize TSV: phenocodes with pLoF burden signal missed by '
+                            'the current baseline scores. Writes the (phenocode, coding) '
+                            'pairs straight to the FlexRV phenotype list path, plus a '
+                            'stats CSV.'
+                        ))
+    parser.add_argument('--overwrite_summary', action='store_true',
+                        help=(
+                            'Force --summarize to rebuild and re-export the joined significant-'
+                            'results TSV even if it already exists. If not set and the TSV '
+                            'already exists, the join/export step is skipped (the overlap '
+                            'figure is still (re)generated from the existing TSV).'
+                        ))
     return parser.parse_args()
 
 
 
 def main(args):
-    hl.init_batch(
-        billing_project="all-by-aou",
-        remote_tmpdir='gs://aou_tmp/v8',   # note: remote_tmpdir, not tmp_dir, for the batch backend
-        worker_memory='10Gi',
-        driver_memory='highmem',
-        gcs_requester_pays_configuration="aou-neale-gwas",
-    )
-    
+    if args.run_tmp or args.run_burden or args.summarize:
+        hl.init_batch(
+            billing_project="all-by-aou",
+            remote_tmpdir='gs://aou_tmp/v8',   # note: remote_tmpdir, not tmp_dir, for the batch backend
+            # worker_memory='10Gi',
+            worker_memory='highmem',
+            driver_memory='highmem',
+            gcs_requester_pays_configuration="aou-neale-gwas",
+        )
+
     if args.run_tmp:
         run_temporary()
 
@@ -664,26 +973,26 @@ def main(args):
             ht_scallion = ht_scallion.checkpoint(ht_scallion_path, overwrite=True)
 
 
-        if args.use_flexrv:
-            PRIMARY_SCORE_FIELDS = ['AM_pct', 'scallion_bin_Random-Forest_prob_pct']
+        if args.burden_mode == 'flexrv':
+            PRIMARY_SCORE_FIELDS = ['AM_pct', 'pred_scallion_prob_mixture_clinvar_multi_drop_conflicting_pct']
             MAF_FIELD = 'AF.Cases'
-            BATCH_SIZE = 150
-            BASE_PATH = 'gs://aou_amc/data/scallion/burden/'
+            BATCH_SIZE = 80
+            BASE_PATH = FLEXRV_BASE_PATH
 
             print("[flexRV] Starting flexRV burden pipeline...")
-            ht_scallion = genebass_cleanup(ht_scallion, PRIMARY_SCORE_FIELDS)
+            ht_scallion = ht_scallion.select(*PRIMARY_SCORE_FIELDS)
 
             # --- Configure trait type ---
             trait_config = {
                 'bin': (
                     hl.literal(['icd10', 'categorical']).contains(mt_genebass.trait_type),
-                    f'{BASE_PATH}/phenotypes_flexRV/binary_phenos.tsv',
+                    FLEXRV_PHENOS_PATH['bin'],
                     run_flexrv_burden_bin,
                     'flexrv_burden_bin',
                 ),
                 'qt': (
                     mt_genebass.trait_type == 'continuous',
-                    f'{BASE_PATH}/phenotypes_flexRV/qt_phenos.tsv',
+                    FLEXRV_PHENOS_PATH['qt'],
                     run_flexrv_burden_quant,
                     'flexrv_burden_qt',
                 ),
@@ -720,6 +1029,7 @@ def main(args):
             mt_genebass = mt_genebass.filter_rows(
                 hl.is_defined(scallion) | hl.or_else(mt_genebass.annotation == 'pLoF', False)
             )
+            scallion = ht_scallion[mt_genebass.row_key]
             mt_genebass = mt_genebass.annotate_rows(
                 **{f: scallion[f] for f in PRIMARY_SCORE_FIELDS}
             )
@@ -757,9 +1067,10 @@ def main(args):
             print(f"[flexRV] All {n_batches} batch(es) complete.")
         
         else:
-            print("[standard] Starting standard burden pipeline...")
-            BASE_PATH = 'gs://aou_amc/scallion/benchmark/data/genebass/ukb_weighted_burden'
-            
+            print(f"[standard] Starting standard burden pipeline ({args.burden_mode})...")
+            BASE_PATH = UKB_BURDEN_BASE_PATH
+            weighted  = args.burden_mode == 'multithreshold_weighted'
+
             # mt_genebass = filter_scallion_data(mt_genebass)
             mt_genebass = mt_genebass.filter_rows(hl.is_defined(ht_scallion[mt_genebass.locus, mt_genebass.alleles]))
 
@@ -789,12 +1100,12 @@ def main(args):
                 'bin': (
                     mt_genebass.filter_cols(hl.literal(["icd10", "categorical"]).contains(mt_genebass.trait_type) & (mt_genebass.modifier != "custom")),
                     run_all_models_batched_bin,
-                    f'{BASE_PATH}/bin_multithreshold_unweighted.mt',
+                    f'{BASE_PATH}/bin_{args.burden_mode}.mt',
                 ),
                 'qt': (
                     mt_genebass.filter_cols(mt_genebass.trait_type == 'continuous'),
                     run_all_models_batched_quant,
-                    f'{BASE_PATH}/qt_multithreshold_unweighted.mt',
+                    f'{BASE_PATH}/qt_{args.burden_mode}.mt',
                 ),
             }
 
@@ -804,86 +1115,93 @@ def main(args):
             mt_filtered, run_fn, out_path = trait_config[args.trait_type]
             print(f"[standard] Running '{args.trait_type}' burden model...")
             top_pcts = [0.10, 0.25, 0.50, 0.75, 0.85]
-            gene_mt = run_fn(mt_filtered, calibrated_scores, top_pcts=top_pcts, weighted = False)
+            gene_mt = run_fn(mt_filtered, calibrated_scores, top_pcts=top_pcts, weighted=weighted)
             gene_mt = gene_mt.checkpoint(out_path, overwrite=True)
             print(f"[standard] Done — checkpoint written to {out_path}.")
 
     if args.summarize:
         # ── CONFIG ───────────────────────────────────────────────────────────────
         GENEBASS_PATH    = "gs://ukbb-exome-public/500k/results/results.mt"
-        BASE_PATH = f"gs://aou_amc/scallion/benchmark/data/genebass/ukb_weighted_burden/{args.trait_type}_multithreshold_unweighted"
+        BASE_PATH = f"{UKB_BURDEN_BASE_PATH}/{args.trait_type}_{args.burden_mode}"
         WEIGHTED_RESULTS_PATH = f"{BASE_PATH}.mt"
         OUT_TSV          = f"{BASE_PATH}.tsv"
         OUT_HT           = f"{BASE_PATH}.ht"
         REKEY_GB_HT      = "gs://aou_amc/data/scallion/genebass/burden_results_v2/_tmp_gb_rekeyed.ht"
         REKEY_SC_HT      = "gs://aou_amc/data/scallion/genebass/burden_results_v2/_tmp_sc_rekeyed.ht"
-        SIG_THRESHOLD    = 2.5e-6
-        DROP_COLS = ['interval', 'markerIDs', 'description', 
+        SIG_THRESHOLD    = PHENO_SELECT_SIG_THRESHOLD
+        DROP_COLS = ['interval', 'markerIDs', 'description',
                      'description_more', 'coding_description', 'category']
-        
 
-        # ── 1. BUILD & CHECKPOINT gb_ht ──────────────────────────────────────────
-        # Filter INSIDE the MT (before entries()) so only significant rows/entries
-        # are flattened — avoids exploding the full cross-product.
-        sc_results = hl.read_matrix_table(WEIGHTED_RESULTS_PATH)
-        sc_phenocodes = sc_results.cols().key_by().select('phenocode', 'coding')
-        sc_phenocode_set = hl.literal(
-            sc_phenocodes.aggregate(hl.agg.collect_as_set(sc_phenocodes.phenocode))
-        )
-        
-        gene_mt = hl.read_matrix_table(GENEBASS_PATH)
-        gene_mt = gene_mt.filter_cols(
-            sc_phenocode_set.contains(gene_mt.phenocode)
-        )
-        gene_mt = gene_mt.filter_rows(
-            hl.agg.any(
+        if args.overwrite_summary or not hl.hadoop_exists(OUT_TSV):
+            # ── 1. BUILD & CHECKPOINT gb_ht ──────────────────────────────────────
+            # Filter INSIDE the MT (before entries()) so only significant rows/entries
+            # are flattened — avoids exploding the full cross-product.
+            sc_results = hl.read_matrix_table(WEIGHTED_RESULTS_PATH)
+            sc_phenocodes = sc_results.cols().key_by().select('phenocode', 'coding')
+            sc_phenocode_set = hl.literal(
+                sc_phenocodes.aggregate(hl.agg.collect_as_set(sc_phenocodes.phenocode))
+            )
+
+            gene_mt = hl.read_matrix_table(GENEBASS_PATH)
+            gene_mt = gene_mt.filter_cols(
+                sc_phenocode_set.contains(gene_mt.phenocode)
+            )
+            gene_mt = gene_mt.filter_rows(
+                hl.agg.any(
+                    (gene_mt.Pvalue_Burden > 0) & (gene_mt.Pvalue_Burden < SIG_THRESHOLD)
+                )
+            )
+            gene_mt = gene_mt.filter_entries(
                 (gene_mt.Pvalue_Burden > 0) & (gene_mt.Pvalue_Burden < SIG_THRESHOLD)
             )
-        )
-        gene_mt = gene_mt.filter_entries(
-            (gene_mt.Pvalue_Burden > 0) & (gene_mt.Pvalue_Burden < SIG_THRESHOLD)
-        )
 
-        gb_ht = (
-            gene_mt.entries()
-            .drop(*DROP_COLS)
-            .key_by('gene_symbol', 'phenocode', 'coding')
-            .select('annotation', 'trait_type', 'pheno_sex', 'modifier', 'Pvalue_Burden')
-            .checkpoint(REKEY_GB_HT, overwrite=True)
-        )
+            gb_ht = (
+                gene_mt.entries()
+                .drop(*DROP_COLS)
+                .key_by('gene_symbol', 'phenocode', 'coding')
+                .select('annotation', 'trait_type', 'pheno_sex', 'modifier', 'Pvalue_Burden')
+                .checkpoint(REKEY_GB_HT, overwrite=True)
+            )
 
-        # ── 2. BUILD & CHECKPOINT sc_ht ──────────────────────────────────────────
-        # sc_results = hl.read_matrix_table(BIN_RESULTS_PATH) # Read earlier
-        def make_entry_sig(mt):
-            return hl.any([
-                (mt.entry[f] > 0) & (mt.entry[f] < SIG_THRESHOLD)
-                for f in p_fields
-            ])
-        
-        # p_fields = [f for f in sc_results.entry if f.startswith('p_scallion_')]
-        p_fields = [f for f in sc_results.entry if f.startswith('p_')]
+            # ── 2. BUILD & CHECKPOINT sc_ht ──────────────────────────────────────
+            def make_entry_sig(mt):
+                return hl.any([
+                    (mt.entry[f] > 0) & (mt.entry[f] < SIG_THRESHOLD)
+                    for f in p_fields
+                ])
 
-        # Build a significance flag across all p_scallion_* fields at entry level
-        sc_results = sc_results.filter_rows(hl.agg.any(make_entry_sig(sc_results)))
-        sc_results = sc_results.filter_entries(make_entry_sig(sc_results))
+            p_fields = [f for f in sc_results.entry if f.startswith('p_')]
 
-        sc_ht = sc_results.entries().rename({'gene': 'gene_symbol'})
-        sc_ht = (
-            sc_ht
-            .key_by('gene_symbol', 'phenocode', 'coding')
-            .select(*p_fields)
-            .checkpoint(REKEY_SC_HT, overwrite=True)
-        )
+            # Build a significance flag across all p_scallion_* fields at entry level
+            sc_results = sc_results.filter_rows(hl.agg.any(make_entry_sig(sc_results)))
+            sc_results = sc_results.filter_entries(make_entry_sig(sc_results))
 
-        # ── 3. JOIN ───────────────────────────────────────────────────────────────
-        # Both sides are now tiny — the join and shuffle are cheap
-        joined_ht = gb_ht.join(sc_ht, how='outer')
+            sc_ht = sc_results.entries().rename({'gene': 'gene_symbol'})
+            sc_ht = (
+                sc_ht
+                .key_by('gene_symbol', 'phenocode', 'coding')
+                .select(*p_fields)
+                .checkpoint(REKEY_SC_HT, overwrite=True)
+            )
 
-        # ── 4. WRITE OUTPUT ───────────────────────────────────────────────────────
-        joined_ht = joined_ht.naive_coalesce(200).checkpoint(OUT_HT, overwrite=True)
-        joined_ht.export(OUT_TSV)
-        print(f"Significant rows written → {OUT_HT}")
-        print(f"TSV exported             → {OUT_TSV}")
+            # ── 3. JOIN ───────────────────────────────────────────────────────────
+            # Both sides are now tiny — the join and shuffle are cheap
+            joined_ht = gb_ht.join(sc_ht, how='outer')
+
+            # ── 4. WRITE OUTPUT ───────────────────────────────────────────────────
+            joined_ht = joined_ht.naive_coalesce(200).checkpoint(OUT_HT, overwrite=True)
+            joined_ht.export(OUT_TSV)
+            print(f"Significant rows written → {OUT_HT}")
+            print(f"TSV exported             → {OUT_TSV}")
+        else:
+            print(f"[summarize] {OUT_TSV} already exists — skipping join/export "
+                  f"(use --overwrite_summary to force).")
+
+        # ── 5. VISUALIZE ─────────────────────────────────────────────────────────
+        plot_missense_lof_overlap(args.trait_type, OUT_TSV)
+
+    if args.select_phenos_flexrv:
+        select_phenotypes_for_flexrv(args.trait_type, args.burden_mode)
 
 
 if __name__ == '__main__':
