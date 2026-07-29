@@ -101,12 +101,27 @@ def _entry_weight_dict(
 
 
 # ── Cauchy Combination Test helpers ───────────────────────────────────────────
+# Below this p-value, tan((0.5 - p) * pi) loses precision (0.5 - p rounds to
+# 0.5 in float64 once p is within ~1e-16 of it), since the ulp of 0.5 is
+# ~1.1e-16. Use the small-angle approximation tan(pi/2 - x) ≈ 1/x (x = p*pi)
+# instead, which is exact in the limit and avoids that cancellation.
+CCT_SMALL_P_CUTOFF = 1e-16
+# Above this Cauchy-statistic magnitude, 0.5 - atan(T)/pi cancels down to
+# noise (atan(T)/pi is already within float64 epsilon of 0.5). Switch to the
+# Cauchy tail asymptote 1/(pi*T), which is what 0.5 - atan(T)/pi converges to
+# analytically anyway — this is the standard fix used in the reference ACAT
+# implementation (Liu & Xie 2020) and in STAAR/SAIGE-GENE+.
+CCT_LARGE_T_CUTOFF = 1e15
+
+
 def add_cct_p_entry(
     gene_mt:      hl.MatrixTable,
     score_fields: List[str],
 ) -> hl.MatrixTable:
     """
-    CCT across the 192-weight axis for each (gene, phenotype) entry.
+    CCT across the 192-weight axis for each (gene, phenotype) entry, with
+    equal weights (1/n_valid) over the weight combos that produced a defined
+    p-value.
 
     Expects entry field:
         p_arr: struct{ score_field: array<float64>[N_WEIGHTS] }
@@ -117,27 +132,33 @@ def add_cct_p_entry(
     """
     pi = hl.float64(math.pi)
 
+    def cauchy_term(p):
+        p_clip = hl.max(hl.float64(0.0), hl.min(hl.float64(1.0), p))
+        return hl.if_else(
+            p_clip < CCT_SMALL_P_CUTOFF,
+            hl.float64(1.0) / (p_clip * pi),
+            hl.tan((hl.float64(0.5) - p_clip) * pi),
+        )
+
     final = {}
     for sf in score_fields:
         p_arr = gene_mt.p_arr[sf]   # array<float64>[N_WEIGHTS]
 
         cauchy_terms = p_arr.map(
-            lambda p: hl.if_else(
-                hl.is_defined(p),
-                hl.tan(
-                    (hl.float64(0.5) - hl.max(hl.float64(1e-15), hl.min(hl.float64(1.0), p)))
-                    * pi
-                ),
-                hl.missing(hl.tfloat64),
-            )
+            lambda p: hl.if_else(hl.is_defined(p), cauchy_term(p), hl.missing(hl.tfloat64))
         )
 
         valid_terms = cauchy_terms.filter(hl.is_defined)
         n_valid     = hl.len(valid_terms)
+        t_stat      = hl.sum(valid_terms) / hl.float64(n_valid)
 
         final[sf] = hl.if_else(
             n_valid > 0,
-            hl.float64(0.5) - hl.atan(hl.sum(valid_terms) / hl.float64(n_valid)) / pi,
+            hl.if_else(
+                t_stat > CCT_LARGE_T_CUTOFF,
+                hl.float64(1.0) / (t_stat * pi),
+                hl.float64(0.5) - hl.atan(t_stat) / pi,
+            ),
             hl.missing(hl.tfloat64),
         )
 
@@ -146,6 +167,82 @@ def add_cct_p_entry(
     )
 
 
+def _list_flexrv_batch_paths(trait_type: str) -> List[str]:
+    """
+    Discovers the batch checkpoints run_flexrv_burden_bin/quant wrote for
+    `trait_type` under FLEXRV_BASE_PATH/burden_results/ (one per --run_burden
+    --burden_mode flexrv phenotype batch), in batch order.
+    """
+    out_prefix = FLEXRV_BATCH_OUT_PREFIX[trait_type]
+    batch_dir  = f'{FLEXRV_BASE_PATH}burden_results'
+    pattern    = re.compile(rf'{re.escape(out_prefix)}_batch(\d+)\.mt/?$')
+
+    matches = []
+    for entry in hl.hadoop_ls(batch_dir):
+        m = pattern.search(entry['path'])
+        if m:
+            matches.append((int(m.group(1)), entry['path']))
+
+    if not matches:
+        raise FileNotFoundError(
+            f"No FlexRV batch checkpoints found under {batch_dir} matching "
+            f"'{out_prefix}_batch*.mt' — run --run_burden --burden_mode flexrv "
+            f"--trait_type {trait_type} first."
+        )
+    return [path for _, path in sorted(matches)]
+
+
+def combine_flexrv_cct(
+    trait_type:    str,
+    score_fields:  List[str] = None,
+    sig_threshold: float     = None,
+) -> hl.MatrixTable:
+    """
+    Merges the batched FlexRV burden checkpoints for `trait_type` (each batch
+    holds a disjoint phenotype column slice over the same gene rows) and
+    collapses the 192-weight grid into one CCT p-value per gene × phenotype ×
+    score field via add_cct_p_entry.
+
+    Writes:
+      - the combined gene_mt (cct_p + n_var; the per-weight p_arr/z_arr are
+        dropped once collapsed — the raw per-batch checkpoints they came from
+        are untouched) ->
+        FLEXRV_BASE_PATH/burden_results/{trait_type}_flexrv_cct.mt
+      - a flattened TSV of nominally significant (cct_p < sig_threshold in
+        any score field) gene × phenotype × score-field rows ->
+        FLEXRV_BASE_PATH/{trait_type}_flexrv_cct.tsv
+    """
+    score_fields  = score_fields  or FLEXRV_PRIMARY_SCORE_FIELDS
+    sig_threshold = sig_threshold if sig_threshold is not None else PHENO_SELECT_SIG_THRESHOLD
+
+    batch_paths = _list_flexrv_batch_paths(trait_type)
+    print(f"[flexrv_cct] Combining {len(batch_paths)} batch(es) for '{trait_type}': {batch_paths}")
+
+    gene_mt = hl.read_matrix_table(batch_paths[0])
+    for path in batch_paths[1:]:
+        gene_mt = gene_mt.union_cols(hl.read_matrix_table(path))
+
+    gene_mt = add_cct_p_entry(gene_mt, score_fields)
+    gene_mt = gene_mt.drop('p_arr', 'z_arr')
+
+    out_mt_path = f'{FLEXRV_BASE_PATH}burden_results/{trait_type}_flexrv_cct.mt'
+    gene_mt = gene_mt.checkpoint(out_mt_path, overwrite=True)
+    print(f"[flexrv_cct] Combined CCT result written -> {out_mt_path}")
+
+    sig_ht = gene_mt.entries()
+    sig_ht = sig_ht.filter(
+        hl.any([
+            (sig_ht.cct_p[sf] > 0) & (sig_ht.cct_p[sf] < sig_threshold)
+            for sf in score_fields
+        ])
+    )
+    sig_ht = sig_ht.select('phenocode', 'coding', 'trait_type', 'modifier', 'n_var', 'cct_p')
+
+    out_tsv_path = f'{FLEXRV_BASE_PATH}{trait_type}_flexrv_cct.tsv'
+    sig_ht.export(out_tsv_path)
+    print(f"[flexrv_cct] Significant (p < {sig_threshold:.1e}) rows exported -> {out_tsv_path}")
+
+    return gene_mt
 
 
 
@@ -569,6 +666,14 @@ FLEXRV_PHENOS_PATH      = {
     'bin': f'{FLEXRV_PHENOS_BASE_PATH}phenotypes_flexRV/binary_phenos.tsv',
     'qt':  f'{FLEXRV_PHENOS_BASE_PATH}phenotypes_flexRV/qt_phenos.tsv',
 }
+# Score fields + MAF field the FlexRV weight grid is built from (--run_burden
+# --burden_mode flexrv) and later combined across (combine_flexrv_cct).
+FLEXRV_PRIMARY_SCORE_FIELDS: List[str] = [
+    'AM_pct',
+    'pred_scallion_prob_mixture_clinvar_multi_drop_conflicting_pct',
+]
+FLEXRV_MAF_FIELD = 'AF.Cases'
+FLEXRV_BATCH_OUT_PREFIX = {'bin': 'flexrv_burden_bin', 'qt': 'flexrv_burden_qt'}
 
 PHENO_SELECT_SIG_THRESHOLD = 2.5e-6
 PHENO_SELECT_N             = 100
@@ -935,12 +1040,19 @@ def parse_args():
                             'already exists, the join/export step is skipped (the overlap '
                             'figure is still (re)generated from the existing TSV).'
                         ))
+    parser.add_argument('--combine_flexrv_cct', action='store_true',
+                        help=(
+                            'Merge the batched --run_burden --burden_mode flexrv checkpoints '
+                            'for --trait_type and collapse the 192-weight grid into one CCT '
+                            'p-value per gene x phenotype x score field (see add_cct_p_entry '
+                            '/ combine_flexrv_cct).'
+                        ))
     return parser.parse_args()
 
 
 
 def main(args):
-    if args.run_tmp or args.run_burden or args.summarize:
+    if args.run_tmp or args.run_burden or args.summarize or args.combine_flexrv_cct:
         hl.init_batch(
             billing_project="all-by-aou",
             remote_tmpdir='gs://aou_tmp/v8',   # note: remote_tmpdir, not tmp_dir, for the batch backend
@@ -974,8 +1086,8 @@ def main(args):
 
 
         if args.burden_mode == 'flexrv':
-            PRIMARY_SCORE_FIELDS = ['AM_pct', 'pred_scallion_prob_mixture_clinvar_multi_drop_conflicting_pct']
-            MAF_FIELD = 'AF.Cases'
+            PRIMARY_SCORE_FIELDS = FLEXRV_PRIMARY_SCORE_FIELDS
+            MAF_FIELD = FLEXRV_MAF_FIELD
             BATCH_SIZE = 80
             BASE_PATH = FLEXRV_BASE_PATH
 
@@ -988,13 +1100,13 @@ def main(args):
                     hl.literal(['icd10', 'categorical']).contains(mt_genebass.trait_type),
                     FLEXRV_PHENOS_PATH['bin'],
                     run_flexrv_burden_bin,
-                    'flexrv_burden_bin',
+                    FLEXRV_BATCH_OUT_PREFIX['bin'],
                 ),
                 'qt': (
                     mt_genebass.trait_type == 'continuous',
                     FLEXRV_PHENOS_PATH['qt'],
                     run_flexrv_burden_quant,
-                    'flexrv_burden_qt',
+                    FLEXRV_BATCH_OUT_PREFIX['qt'],
                 ),
             }
 
@@ -1202,6 +1314,9 @@ def main(args):
 
     if args.select_phenos_flexrv:
         select_phenotypes_for_flexrv(args.trait_type, args.burden_mode)
+
+    if args.combine_flexrv_cct:
+        combine_flexrv_cct(args.trait_type)
 
 
 if __name__ == '__main__':
