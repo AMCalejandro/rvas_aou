@@ -28,3 +28,6 @@ pytest = ">=7.0"
 
 # Cloud storage (gs:// read/write via pandas)
 gcsfs = ">=2023.1.0"
+
+# Parquet I/O
+pyarrow = ">=14.0.0"
