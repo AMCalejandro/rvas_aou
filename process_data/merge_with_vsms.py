@@ -4,22 +4,6 @@ import pandas as pd
 import pickle
 import argparse
 
-from clinvar_enrichment import ( # Intended - Pass module via --pyfiles
-    build_clinvar_ht,
-    report_clinvar_priors,
-    select_enriched_genes,
-    DEFAULT_SC_GENES_ALL_PATH,
-    DEFAULT_SC_GENES_MULTI_PATH,
-    DEFAULT_OUTPUT_PATH as DEFAULT_CLINVAR_HT_PATH,
-    DEFAULT_HIGH_ENRICHMENT_OUTPUT,
-    DEFAULT_LOW_ENRICHMENT_OUTPUT,
-    MIN_MISSENSE_VARIANTS,
-    N_GENES,
-    Z,
-)
-
-
-
 VSMS_INNER_PATH = 'gs://grohlicek/genetics_gym_vsm_all_content/full_analysis_tables/gene_aggregated/variant_scores_all_outer_ensg_stats_eval.parquet'
 
 SCALLION_COLS = [
@@ -47,6 +31,9 @@ DEFAULT_CLINVAR_PRIORS_OUTPUT_CSV = 'gs://aou_amc/data/utils/clinvar/clinvar_pri
 
 DEFAULT_GENEBASS_VARS_PATH = 'gs://aou_amc/scallion/benchmark/data/genebass_allvars.tsv'
 DEFAULT_GENEBASS_VSM_OUTPUT_PATH = 'gs://aou_amc/scallion/benchmark/data/genebass_w_vsm.tsv.gz'
+
+DEFAULT_VSM_ALL_OUTPUT_PATH = 'gs://aou_amc/scallion/data/predictions/all_missense.parquet/'
+DEFAULT_N_BUCKETS = 256
 
 missing_ids = {
     'AC022414.1': 'ENSG00000284762',
@@ -113,8 +100,10 @@ def parse_args():
         '--merge_type',
         type=str,
         required=True,
-        choices=['vsm_scallion', 'clinvar_vsm', 'genebass_vsm'],
-        help="Type of merge operation to perform: 'vsm_scallion', 'clinvar_vsm', or 'genebass_vsm'."
+        choices=['vsm_scallion', 'clinvar_vsm', 'genebass_vsm', 'vsm_all'],
+        help="Type of merge operation to perform: 'vsm_scallion', 'clinvar_vsm', 'genebass_vsm', "
+             "or 'vsm_all' (no filter/join — projects VSMS_COLS from every row of VSMS_INNER_PATH, "
+             "hash-bucketed by gene for downstream batched prediction)."
     )
     parser.add_argument(
         '--overwrite',
@@ -126,18 +115,6 @@ def parse_args():
         action='store_true',
         help="If set (within merge_type='vsm_scallion'), run the VSM-vs-scallion "
              "statistical comparison and save the summary table and figure."
-    )
-    parser.add_argument(
-        '--sc_genes_all_path',
-        type=str,
-        default=DEFAULT_SC_GENES_ALL_PATH,
-        help="(merge_type='clinvar_vsm') Gene list used by build_clinvar_ht to flag in_scallion_genes."
-    )
-    parser.add_argument(
-        '--clinvar_ht_path',
-        type=str,
-        default=DEFAULT_CLINVAR_HT_PATH,
-        help="(merge_type='clinvar_vsm') Where to checkpoint/read the filtered ClinVar Hail Table."
     )
     parser.add_argument(
         '--clinvar_vsm_output_path',
@@ -164,40 +141,19 @@ def parse_args():
              "select step (high/low deleterious-missense-enrichment genes) on the ClinVar HT."
     )
     parser.add_argument(
-        '--sc_genes_multi_path',
+        '--vsm_all_output_path',
         type=str,
-        default=DEFAULT_SC_GENES_MULTI_PATH,
-        help="(--missense_enrichment) Scallion multi-gene list, used to label genes single vs. multi."
+        default=DEFAULT_VSM_ALL_OUTPUT_PATH,
+        help="(merge_type='vsm_all') Directory to write the gene-hash-bucketed VSMS_COLS-only "
+             "parquet dataset to."
     )
     parser.add_argument(
-        '--min_missense_variants',
+        '--n_buckets',
         type=int,
-        default=MIN_MISSENSE_VARIANTS,
-        help="(--missense_enrichment) Floor on classified missense variants/gene before ranking."
-    )
-    parser.add_argument(
-        '--n_genes',
-        type=int,
-        default=N_GENES,
-        help="(--missense_enrichment) Number of genes to keep per scallion_label at each extreme."
-    )
-    parser.add_argument(
-        '--z',
-        type=float,
-        default=Z,
-        help="(--missense_enrichment) Z-score for the Wilson interval (1.96 ~= 95%%)."
-    )
-    parser.add_argument(
-        '--high_enrichment_output_path',
-        type=str,
-        default=DEFAULT_HIGH_ENRICHMENT_OUTPUT,
-        help="(--missense_enrichment) Where to export the high-enrichment gene table (TSV)."
-    )
-    parser.add_argument(
-        '--low_enrichment_output_path',
-        type=str,
-        default=DEFAULT_LOW_ENRICHMENT_OUTPUT,
-        help="(--missense_enrichment) Where to export the low-enrichment gene table (TSV)."
+        default=DEFAULT_N_BUCKETS,
+        help="(merge_type='vsm_all') Number of gene-hash buckets to partition the output into. "
+             "Every variant for a given gene always lands in the same bucket, so downstream "
+             "per-gene processing (e.g. percentiles) can safely process one bucket at a time."
     )
     return parser.parse_args()
 
@@ -306,8 +262,22 @@ def main(args):
             )
 
     elif merge_type == 'clinvar_vsm':
+        from clinvar_enrichment import ( # Intended - Pass module via --pyfiles
+            build_clinvar_ht,
+            report_clinvar_priors,
+            select_enriched_genes,
+            DEFAULT_SC_GENES_ALL_PATH,
+            DEFAULT_SC_GENES_MULTI_PATH,
+            DEFAULT_OUTPUT_PATH as DEFAULT_CLINVAR_HT_PATH,
+            DEFAULT_HIGH_ENRICHMENT_OUTPUT,
+            DEFAULT_LOW_ENRICHMENT_OUTPUT,
+            MIN_MISSENSE_VARIANTS,
+            N_GENES,
+            Z,
+        )
+
         print(f"merge_type '{merge_type}' ")
-        clinvar_ht_path      = args.clinvar_ht_path
+        clinvar_ht_path      = DEFAULT_CLINVAR_HT_PATH
         data_processed_path  = args.clinvar_vsm_output_path
         vsms_inner           = VSMS_INNER_PATH
 
@@ -321,7 +291,7 @@ def main(args):
         if need_ht:
             if not hl.hadoop_exists(clinvar_ht_path) or args.overwrite:
                 ht = build_clinvar_ht(
-                    sc_genes_all_path=args.sc_genes_all_path,
+                    sc_genes_all_path=DEFAULT_SC_GENES_ALL_PATH,
                     output_path=clinvar_ht_path,
                     overwrite=args.overwrite,
                 )
@@ -370,16 +340,16 @@ def main(args):
             print("Selecting high/low deleterious-missense-enrichment genes...")
             high_enrichment, low_enrichment = select_enriched_genes(
                 ht,
-                sc_genes_all_path=args.sc_genes_all_path,
-                sc_genes_multi_path=args.sc_genes_multi_path,
-                min_missense_variants=args.min_missense_variants,
-                n_genes=args.n_genes,
-                z=args.z,
+                sc_genes_all_path=DEFAULT_SC_GENES_ALL_PATH,
+                sc_genes_multi_path=DEFAULT_SC_GENES_MULTI_PATH,
+                min_missense_variants=MIN_MISSENSE_VARIANTS,
+                n_genes=N_GENES,
+                z=Z,
             )
-            high_enrichment.export(args.high_enrichment_output_path)
-            low_enrichment.export(args.low_enrichment_output_path)
-            print(f"Wrote high-enrichment genes to {args.high_enrichment_output_path}")
-            print(f"Wrote low-enrichment genes to {args.low_enrichment_output_path}")
+            high_enrichment.export(DEFAULT_HIGH_ENRICHMENT_OUTPUT)
+            low_enrichment.export(DEFAULT_LOW_ENRICHMENT_OUTPUT)
+            print(f"Wrote high-enrichment genes to {DEFAULT_HIGH_ENRICHMENT_OUTPUT}")
+            print(f"Wrote low-enrichment genes to {DEFAULT_LOW_ENRICHMENT_OUTPUT}")
 
     elif merge_type == 'genebass_vsm':
         print(f"merge_type '{merge_type}' ")
@@ -427,6 +397,29 @@ def main(args):
             merged.to_csv(data_processed_path, sep='\t', index=False)
         else:
             print(f"{data_processed_path} already exists; nothing to do.")
+
+    elif merge_type == 'vsm_all':
+        print(f"merge_type '{merge_type}' ")
+        output_path = args.vsm_all_output_path.rstrip('/')
+        n_buckets   = args.n_buckets
+        vsms_inner  = VSMS_INNER_PATH
+        success_marker = f'{output_path}/_SUCCESS'
+
+        print(f"vsm_all_output_path: {output_path}")
+        print(f"n_buckets: {n_buckets}")
+
+        need_write = not hl.hadoop_exists(success_marker) or args.overwrite
+
+        if need_write:
+            from pyspark.sql import SparkSession
+            spark = SparkSession.builder.getOrCreate()
+
+            df = spark.read.parquet(vsms_inner).select(*VSMS_COLS)
+            df = df.repartition(n_buckets, 'ensg')
+            df.write.mode('overwrite').parquet(output_path)
+            print(f"Wrote gene-hash-bucketed VSMS_COLS dataset -> {output_path}")
+        else:
+            print(f"{output_path} already exists (found {success_marker}); nothing to do.")
 
 
 if __name__ == '__main__':
