@@ -1,5 +1,7 @@
 import hail as hl
+import pyarrow as pa
 import pyarrow.dataset as ds
+import pyarrow.parquet as pq
 import pandas as pd
 import pickle
 import argparse
@@ -32,8 +34,7 @@ DEFAULT_CLINVAR_PRIORS_OUTPUT_CSV = 'gs://aou_amc/data/utils/clinvar/clinvar_pri
 DEFAULT_GENEBASS_VARS_PATH = 'gs://aou_amc/scallion/benchmark/data/genebass_allvars.tsv'
 DEFAULT_GENEBASS_VSM_OUTPUT_PATH = 'gs://aou_amc/scallion/benchmark/data/genebass_w_vsm.tsv.gz'
 
-DEFAULT_VSM_ALL_OUTPUT_PATH = 'gs://aou_amc/scallion/data/predictions/all_missense.parquet/'
-DEFAULT_N_BUCKETS = 256
+DEFAULT_VSM_ALL_OUTPUT_PATH = 'gs://aou_amc/scallion/data/predictions/all_missense.parquet'
 
 missing_ids = {
     'AC022414.1': 'ENSG00000284762',
@@ -100,10 +101,10 @@ def parse_args():
         '--merge_type',
         type=str,
         required=True,
-        choices=['vsm_scallion', 'clinvar_vsm', 'genebass_vsm', 'vsm_all'],
+        choices=['scallion_vsm', 'clinvar_vsm', 'genebass_vsm', 'vsm_all'],
         help="Type of merge operation to perform: 'vsm_scallion', 'clinvar_vsm', 'genebass_vsm', "
-             "or 'vsm_all' (no filter/join — projects VSMS_COLS from every row of VSMS_INNER_PATH, "
-             "hash-bucketed by gene for downstream batched prediction)."
+             "or 'vsm_all' (no filter/join — projects VSMS_COLS from every row of VSMS_INNER_PATH "
+             "into a single parquet file)."
     )
     parser.add_argument(
         '--overwrite',
@@ -144,16 +145,7 @@ def parse_args():
         '--vsm_all_output_path',
         type=str,
         default=DEFAULT_VSM_ALL_OUTPUT_PATH,
-        help="(merge_type='vsm_all') Directory to write the gene-hash-bucketed VSMS_COLS-only "
-             "parquet dataset to."
-    )
-    parser.add_argument(
-        '--n_buckets',
-        type=int,
-        default=DEFAULT_N_BUCKETS,
-        help="(merge_type='vsm_all') Number of gene-hash buckets to partition the output into. "
-             "Every variant for a given gene always lands in the same bucket, so downstream "
-             "per-gene processing (e.g. percentiles) can safely process one bucket at a time."
+        help="(merge_type='vsm_all') Where to write the VSMS_COLS-only parquet file."
     )
     return parser.parse_args()
 
@@ -172,7 +164,7 @@ def main(args):
         log="/run_scallion.log",
     )
 
-    if merge_type == 'vsm_scallion':
+    if merge_type == 'scallion_vsm':
         if not scallion_prefix:
             raise ValueError("--scallion_prefix is required when --merge_type is 'vsm_scallion'")
 
@@ -400,26 +392,28 @@ def main(args):
 
     elif merge_type == 'vsm_all':
         print(f"merge_type '{merge_type}' ")
-        output_path = args.vsm_all_output_path.rstrip('/')
-        n_buckets   = args.n_buckets
+        output_path = args.vsm_all_output_path
         vsms_inner  = VSMS_INNER_PATH
-        success_marker = f'{output_path}/_SUCCESS'
 
         print(f"vsm_all_output_path: {output_path}")
-        print(f"n_buckets: {n_buckets}")
 
-        need_write = not hl.hadoop_exists(success_marker) or args.overwrite
+        need_write = not hl.hadoop_exists(output_path) or args.overwrite
 
         if need_write:
-            from pyspark.sql import SparkSession
-            spark = SparkSession.builder.getOrCreate()
-
-            df = spark.read.parquet(vsms_inner).select(*VSMS_COLS)
-            df = df.repartition(n_buckets, 'ensg')
-            df.write.mode('overwrite').parquet(output_path)
-            print(f"Wrote gene-hash-bucketed VSMS_COLS dataset -> {output_path}")
+            dataset = ds.dataset(vsms_inner, format="parquet")
+            writer = None
+            total_rows = 0
+            for batch in dataset.to_batches(columns=VSMS_COLS):
+                table = pa.Table.from_batches([batch])
+                if writer is None:
+                    writer = pq.ParquetWriter(output_path, table.schema)
+                writer.write_table(table)
+                total_rows += table.num_rows
+                print(f"  {total_rows} rows written so far", flush=True)
+            writer.close()
+            print(f"Wrote {total_rows} rows -> {output_path}")
         else:
-            print(f"{output_path} already exists (found {success_marker}); nothing to do.")
+            print(f"{output_path} already exists; nothing to do.")
 
 
 if __name__ == '__main__':
