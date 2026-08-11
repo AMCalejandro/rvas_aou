@@ -177,6 +177,10 @@ def build_argparser() -> argparse.ArgumentParser:
                         help="Column to group by for gene-level percentiles. Default: 'gene' "
                              "(genebass/clinvar merges). Raw VSM data (merge_type='vsm_all') has "
                              "no gene symbol column, only 'ensg' — pass --gene-col ensg for that.")
+    parser.add_argument("--pct-columns", type=str, default=None,
+                        help="Comma-separated list of columns to gene-level percentile-rank "
+                             "(e.g. 'AM,mcap,pred_scallion_llr_keep_all'). Default: every non-ID "
+                             "column (all raw scores + all pred_ columns).")
     parser.add_argument("--models-dir", type=str, default=None,
                         help="Directory with one subdirectory per finalized model — every subdirectory "
                              "with a model.pkl is used. Default: the curated MODEL_DIRS list.")
@@ -220,7 +224,8 @@ def main():
         print(f"{pct_output_path} already exists; skipping percentile computation "
               f"(use --overwrite-pct to re-run).")
     else:
-        run_percentiles(df, pct_output_path, gene_col=args.gene_col)
+        pct_fields = [c.strip() for c in args.pct_columns.split(",")] if args.pct_columns else None
+        run_percentiles(df, pct_output_path, gene_col=args.gene_col, fields=pct_fields)
 
 
 if __name__ == "__main__":
