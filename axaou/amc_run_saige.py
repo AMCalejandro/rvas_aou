@@ -629,13 +629,25 @@ def annotate_flexrv_weights(
 GENE_MAP_SOURCES = {'brava', 'gnomad_context'}
 
 
-def export_gene_group_file(interval, ancestry, mode, target_col, gene_map_source, output_dir):
+def export_gene_group_file(interval, ancestry, mode, target_col, gene_map_source, output_root, n_chunks=1):
+    """Write the SAIGE group file(s) for one gene interval.
+
+    With ``n_chunks <= 1`` a single ``{output_root}.gene.txt`` is written (the
+    historical layout). With ``n_chunks > 1`` the interval's genes are split into
+    that many disjoint buckets and one ``{output_root}.chunk_{ci}.gene.txt`` is
+    written per bucket, so each SAIGE step-2 job only has to hold a slice of the
+    weight rows in memory. A gene is never split across chunks.
+    """
     MIN_VARIANTS = 2
     MISSENSE_ANNOTATIONS = {'missenseother_missense', 'missenseLC'}
     GENE_MAP_SOURCES = {'brava', 'gnomad_context'}
 
     if gene_map_source not in GENE_MAP_SOURCES:
         raise ValueError(f"gene_map_source must be one of {sorted(GENE_MAP_SOURCES)}, got '{gene_map_source}'")
+
+    interval_tag = (
+        f"{interval.start.contig}_{str(interval.start.position).zfill(9)}_{interval.end.position}"
+    )
 
     hl.init(
         master='local[*]',
@@ -657,7 +669,7 @@ def export_gene_group_file(interval, ancestry, mode, target_col, gene_map_source
     def repeat_annotation(ht):
         return ht.annotate(annotation=(ht.annotation + ' ') * hl.len(ht.variants))
 
-    def finalize_and_export(var_ht, anno_ht, weight_ht, output_path):
+    def finalize_and_export(var_ht, anno_ht, weight_ht, output_path, n_chunks=n_chunks):
         if weight_ht is None:
             group_ht = var_ht.union(anno_ht)
         else:
@@ -688,7 +700,44 @@ def export_gene_group_file(interval, ancestry, mode, target_col, gene_map_source
         group_ht = group_ht.order_by(group_ht.gene, group_ht.tag_rank, group_ht.tag_suffix)
         group_ht = group_ht.drop('tag_rank', 'tag_suffix')
 
-        group_ht.export(output_path, header=False, delimiter=' ')
+        if n_chunks <= 1:
+            group_ht.export(f"{output_path}.gene.txt", header=False, delimiter=' ')
+            return
+
+        # Materialise the union once: the gene-set aggregation and every per-chunk
+        # filter below would otherwise re-run the whole var/anno/weight pipeline.
+        # `order_by` leaves the table unkeyed, and Hail preserves row order across
+        # write/read, so each chunk keeps its var -> anno -> weight line ordering.
+        group_ht = group_ht.checkpoint(
+            f"{TMP_BUCKET}/gene_group_chunks/{gene_map_source}/{mode}/"
+            f"{target_col or 'no_weight'}/{ancestry.upper()}/{interval_tag}.ht",
+            overwrite=True,
+        )
+
+        genes = sorted(group_ht.aggregate(hl.agg.collect_as_set(group_ht.gene)))
+        n_genes = len(genes)
+        if n_genes == 0:
+            logger.warning(f"No genes left in {interval_tag} after filtering -- no group file written")
+            return
+
+        # Cap at one gene per chunk so SAIGE is never handed an empty group file
+        # (the step-2 wrapper treats a header-only output as a failure).
+        n_used = min(n_chunks, n_genes)
+        base_size, remainder = divmod(n_genes, n_used)
+        gene_to_chunk = {}
+        start = 0
+        for ci in range(n_used):
+            end = start + base_size + (1 if ci < remainder else 0)
+            for gene in genes[start:end]:
+                gene_to_chunk[gene] = ci
+            start = end
+
+        group_ht = group_ht.annotate(chunk_idx=hl.literal(gene_to_chunk)[group_ht.gene])
+
+        logger.info(f"{interval_tag}: writing {n_genes} genes across {n_used} chunk(s)")
+        for ci in range(n_used):
+            chunk_ht = group_ht.filter(group_ht.chunk_idx == ci).drop('chunk_idx')
+            chunk_ht.export(f"{output_path}.chunk_{ci}.gene.txt", header=False, delimiter=' ')
 
     def group_by_gene(ht, extra_aggs=None):
         aggs = dict(
@@ -859,7 +908,7 @@ def export_gene_group_file(interval, ancestry, mode, target_col, gene_map_source
             var_ht,
             anno_ht,
             weight_ht=weight_ht,
-            output_path = output_dir
+            output_path = output_root
         )
     
     elif mode == 'weighted':
@@ -899,7 +948,7 @@ def export_gene_group_file(interval, ancestry, mode, target_col, gene_map_source
             var_ht,
             anno_ht,
             weight_ht=weight_ht,
-            output_path = output_dir
+            output_path = output_root
         )
     
     elif mode == 'unguided':
@@ -918,7 +967,7 @@ def export_gene_group_file(interval, ancestry, mode, target_col, gene_map_source
             var_ht,
             anno_ht,
             weight_ht=None,
-            output_path = output_dir
+            output_path = output_root
         )
     
     else:
@@ -1561,6 +1610,19 @@ def main(args):
         print(f'Analysis type: {analysis_type}')
         print(f'Variant_type: {variant_type}')
         print(f"Docker image: {SAIGE_DOCKER_IMAGE}...")
+
+        # flexRV group files carry N_WEIGHTS weight rows per gene, which a single
+        # SAIGE step-2 job cannot hold in memory. Split each interval's genes into
+        # chunks and run one job per chunk. Every other mode keeps the one-file-per
+        # -interval layout, so group files already on GCS stay valid.
+        n_group_chunks = (
+            args.n_group_chunks
+            if analysis_type == 'gene' and args.saige_gene_mode == 'flexRV'
+            else 1
+        )
+        chunked_group_files = n_group_chunks > 1
+        print(f'Group file chunks per interval: {n_group_chunks}')
+
         RESULT_ROOT = f'{RESULTS_PATH}/{analysis_type}_results'
         EXTERNAL_RESULT_ROOT = f'{EXTERNAL_ANALYSIS_BUCKET}/{analysis_type}_results'
 
@@ -1726,15 +1788,37 @@ def main(args):
                 overwrite_groupfile = args.overwrite_gene_txt
                 bgens_already_created = {}
                 groupfile_already_created = {}
-                
+                group_file_chunks = {}
+
                 if not overwrite_bgens and hfs.exists(bgen_dir):
                     bgens_already_created = {x["path"] for x in hl.hadoop_ls(bgen_dir) if x["path"].endswith(".bgen")}
                 # if not overwrite_groupfile and hfs.exists(bgen_dir):
-                if not overwrite_groupfile and hfs.exists(amc_bgen_dir):
-                    groupfile_already_created = {x["path"] for x in hl.hadoop_ls(amc_bgen_dir) if x["path"].endswith(".txt")}
-                
+                amc_dir_listing = (
+                    [x["path"] for x in hl.hadoop_ls(amc_bgen_dir)] if hfs.exists(amc_bgen_dir) else []
+                )
+                if not overwrite_groupfile:
+                    groupfile_already_created = {p for p in amc_dir_listing if p.endswith(".txt")}
+
+                if chunked_group_files:
+                    # Map each interval's group-file root -> its chunk files, ordered by
+                    # chunk index. Built from the listing rather than range(n_group_chunks)
+                    # because an interval with fewer genes than chunks writes fewer files.
+                    # Not gated on overwrite_groupfile: --skip-bgen --overwrite-gene-txt
+                    # still has to read whatever chunks are already there.
+                    indexed_chunks = {}
+                    for path in amc_dir_listing:
+                        if '.chunk_' not in path or not path.endswith('.gene.txt'):
+                            continue
+                        root, chunk_part = path.rsplit('.chunk_', 1)
+                        indexed_chunks.setdefault(root, []).append((int(chunk_part.split('.')[0]), path))
+                    group_file_chunks = {
+                        root: [p for _, p in sorted(v)] for root, v in indexed_chunks.items()
+                    }
+
                 print(f'Found {len(bgens_already_created)} Bgens in directory...')
                 print(f'Found {len(groupfile_already_created)} groupfiles in directory...')
+                if chunked_group_files:
+                    print(f'Found chunked group files for {len(group_file_chunks)} intervals...')
 
                 bgens = {}
 
@@ -1788,7 +1872,18 @@ def main(args):
                         bgen_index.attributes["ancestry"] = ancestry
                         bgen_index.attributes["analysis_type"] = analysis_type
                     
-                    if ((f"{amc_group_file_root}.gene.txt" not in groupfile_already_created)  or args.overwrite_gene_txt) and analysis_type=='gene':
+                    if chunked_group_files:
+                        # Re-export unless the full set is present: a partial set (job died
+                        # mid-export) would otherwise be read back as if complete and run
+                        # SAIGE on a subset of the interval's genes. Intervals with fewer
+                        # genes than chunks legitimately write fewer files and so re-export
+                        # every time, which is cheap and rare.
+                        group_file_missing = (
+                            len(group_file_chunks.get(amc_group_file_root, [])) != n_group_chunks
+                        )
+                    else:
+                        group_file_missing = f"{amc_group_file_root}.gene.txt" not in groupfile_already_created
+                    if (group_file_missing or args.overwrite_gene_txt) and analysis_type=='gene':
                         gene_txt_task = b.new_python_job(
                             name=f"{analysis_type}_analysis_export_{str(interval)}_gene_txt_{ancestry}"
                         )
@@ -1801,7 +1896,8 @@ def main(args):
                             mode = args.saige_gene_mode,
                             target_col = args.saige_gene_weight,
                             gene_map_source = args.saige_gene_map_source,
-                            output_dir=f"{amc_group_file_root}.gene.txt",
+                            output_root=amc_group_file_root,
+                            n_chunks=n_group_chunks,
                         )
                         gene_txt_task.attributes["ancestry"] = ancestry
                         gene_txt_task.attributes["analysis_type"] = analysis_type
@@ -1822,8 +1918,25 @@ def main(args):
                         }
                     )
                     if analysis_type == 'gene':
-                        group_file = b.read_input(f"{amc_group_file_root}.gene.txt")
-                        bgens[str(interval)] = (bgen_file, group_file)
+                        if chunked_group_files:
+                            chunk_paths = group_file_chunks.get(amc_group_file_root)
+                            if not chunk_paths:
+                                raise FileNotFoundError(
+                                    f"No group file chunks found matching "
+                                    f"{amc_group_file_root}.chunk_*.gene.txt -- export them first "
+                                    f"(run without --skip-bgen, or pass --overwrite-gene-txt)"
+                                )
+                            if len(chunk_paths) != n_group_chunks:
+                                logger.warning(
+                                    f"{amc_group_file_root}: found {len(chunk_paths)} chunks, "
+                                    f"expected {n_group_chunks} -- fine if this interval has "
+                                    f"fewer genes than chunks, otherwise the export was "
+                                    f"incomplete and these results will miss genes"
+                                )
+                            group_files = [b.read_input(p) for p in chunk_paths]
+                        else:
+                            group_files = [b.read_input(f"{amc_group_file_root}.gene.txt")]
+                        bgens[str(interval)] = (bgen_file, group_files)
                     else:
                         bgens[str(interval)] = bgen_file
             
@@ -1889,60 +2002,68 @@ def main(args):
                         print(f'-------------- Found {int(len(results_already_created) / factor)} {analysis_type} results in [{ancestry}: {phenoname}] directory...')
                     
                     for interval in intervals:
-                        results_path = f"{pheno_results_dir}/result_{phenoname}_{interval.start.contig}_{str(interval.start.position).zfill(9)}"
-                        group_file = None
+                        results_path_base = f"{pheno_results_dir}/result_{phenoname}_{interval.start.contig}_{str(interval.start.position).zfill(9)}"
                         max_maf_for_group_test = None
                         sparse_grm_file = None
                         suffix = ''
-                        
+
                         if analysis_type == "gene":
-                            bgen_file, group_file = bgens[str(interval)]
+                            bgen_file, group_files = bgens[str(interval)]
                             max_maf_for_group_test = args.max_maf_group
                             sparse_grm_file = sparse_grm[sparse_grm_extension]
                         else:
                             bgen_file = bgens[str(interval)]
-                        
+                            group_files = [None]
+
                         samples_file = b.read_input(f'{EXTERNAL_DATA_PATH}/utils/grm/{ancestry.upper()}_grm_plink.samples')
 
-                        if (
-                            overwrite_results
-                            or (f"{results_path}.{'gene' if analysis_type == 'gene' else 'single_variant'}.txt"
-                            not in results_already_created)
-                        ):
-                            print("Running saige")
-                            
-                            print(SAIGE_DOCKER_IMAGE)
-                            saige_task = run_saige(
-                                p=b,
-                                phenoname=phenoname,
-                                ancestry=ancestry,
-                                output_root=results_path,
-                                model_file=model_file,
-                                variance_ratio_file=variance_ratio_file,
-                                sparse_grm_file=sparse_grm_file,
-                                # bgen_file=bgen_file,
-                                geno_file=bgen_file,
-                                samples_file=samples_file,
-                                docker_image=SAIGE_DOCKER_IMAGE,
-                                group_file=group_file,
-                                groups=groups,
-                                trait_type=current_trait_type,
-                                chrom=interval.start.contig,
-                                min_mac=1,
-                                min_maf=0,
-                                max_maf_for_group=max_maf_for_group_test,
-                                add_suffix=suffix,
-                                variant_type=variant_type,
-                                # memory=memory
-                                memory='10G'
+                        # One SAIGE job per group-file chunk. Unchunked modes iterate once and
+                        # keep the original result path, so already-computed results still match.
+                        for ci, group_file in enumerate(group_files):
+                            results_path = (
+                                f"{results_path_base}_chunk_{ci}" if chunked_group_files else results_path_base
                             )
-                            saige_task.attributes.update(
-                                {"interval": str(interval), "ancestry": ancestry, 'name': f'saige{analysis_type == "gene"}'}
-                            )
-                            saige_task.attributes.update(
-                                {"phenotype": copy.deepcopy(phenoname)}
-                            )
-                            saige_tasks[phenoname].append(saige_task)
+                            if (
+                                overwrite_results
+                                or (f"{results_path}.{'gene' if analysis_type == 'gene' else 'single_variant'}.txt"
+                                not in results_already_created)
+                            ):
+                                print("Running saige")
+
+                                print(SAIGE_DOCKER_IMAGE)
+                                saige_task = run_saige(
+                                    p=b,
+                                    phenoname=phenoname,
+                                    ancestry=ancestry,
+                                    output_root=results_path,
+                                    model_file=model_file,
+                                    variance_ratio_file=variance_ratio_file,
+                                    sparse_grm_file=sparse_grm_file,
+                                    # bgen_file=bgen_file,
+                                    geno_file=bgen_file,
+                                    samples_file=samples_file,
+                                    docker_image=SAIGE_DOCKER_IMAGE,
+                                    group_file=group_file,
+                                    groups=groups,
+                                    trait_type=current_trait_type,
+                                    chrom=interval.start.contig,
+                                    min_mac=1,
+                                    min_maf=0,
+                                    max_maf_for_group=max_maf_for_group_test,
+                                    add_suffix=suffix,
+                                    variant_type=variant_type,
+                                    # memory=memory
+                                    memory='10G'
+                                )
+                                saige_task.attributes.update(
+                                    {"interval": str(interval), "ancestry": ancestry, 'name': f'saige{analysis_type == "gene"}'}
+                                )
+                                saige_task.attributes.update(
+                                    {"phenotype": copy.deepcopy(phenoname)}
+                                )
+                                if chunked_group_files:
+                                    saige_task.attributes["chunk"] = str(ci)
+                                saige_tasks[phenoname].append(saige_task)
 
                         # if analysis_type == 'gene':
                         #     if (
@@ -2003,7 +2124,10 @@ def main(args):
                     
                     output_ht_directory = f'{root}/phenotype_{phenoname}'
                     null_glmm_log = f'{EXTERNAL_ANALYSIS_BUCKET}/{analysis_type}_results/null_glmm/{ancestry.upper()}/phenotype_{phenoname}.log'
-                    saige_log = f'{directory}/result_{phenoname}_chr1_{"000065419" if analysis_type == "gene" else "000000001"}.{analysis_type}.log'
+                    saige_log_root = f'{directory}/result_{phenoname}_chr1_{"000065419" if analysis_type == "gene" else "000000001"}'
+                    if chunked_group_files:
+                        saige_log_root = f'{saige_log_root}_chunk_0'
+                    saige_log = f'{saige_log_root}.{analysis_type}.log'
                     
                     quantitative_trait = phenoname in quantitative_traits
                     
@@ -2146,6 +2270,14 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--overwrite-gene-txt", help="Force run of gene txt files", action="store_true"
+    )
+    parser.add_argument(
+        "--n-group-chunks",
+        help="Split each interval's group file into this many per-gene chunks and run one "
+             "SAIGE job per chunk. Only applied in --saige-gene-mode flexRV (whose 192 "
+             "weight rows per gene do not fit in one step-2 job); 1 disables chunking",
+        default=10,
+        type=int,
     )
     parser.add_argument(
         "--overwrite-results", help="Force run of SAIGE tests", action="store_true"
